@@ -1,0 +1,42 @@
+name: wds_hand_image
+
+image_shape: &image_shape [3, 224, 224]
+
+shape_meta: &shape_meta
+  obs:
+    image:
+      shape: *image_shape
+      type: rgb
+    state:
+      shape: [48]
+      type: low_dim
+  action:
+    shape: [48]
+
+train_wds_datasets: &train_wds_datasets
+  - name: train
+    shard_urls: data/wds/train/shard-*.tar
+
+val_wds_datasets: &val_wds_datasets
+  - name: val
+    shard_urls: data/wds/val/shard-*.tar
+
+dataset:
+  _target_: diffusion_policy.dataset.wds_hand_image_dataset.WdsHandImageDataset
+  shape_meta: *shape_meta
+  train_wds_datasets: *train_wds_datasets
+  val_wds_datasets: *val_wds_datasets
+  horizon: ${horizon}
+  n_obs_steps: ${dataset_obs_steps}
+  image_stride: 30
+  state_stride: 30
+  action_stride: 1
+  history_pad_mode: repeat
+  action_pad_mode: repeat
+  shuffle_buffer: 16384
+  shuffle_initial: 4096
+  keep_ratio: 1.0
+  use_relative_action: True
+  normalizer_cache_path: data/wds/cache/wds_hand_normalizer.pt
+  normalizer_wds_datasets: *train_wds_datasets
+  max_normalizer_samples: 100000

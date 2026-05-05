@@ -49,6 +49,7 @@ dependencies:
     - pygame==2.1.2
     - robomimic==0.2.0
     - pytorchvideo==0.1.5
+    - webdataset
     - atomics==1.0.2
     # No support for jpeg-xl for MacOS
     - imagecodecs==2022.9.26

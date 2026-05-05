@@ -1,0 +1,205 @@
+import io
+import json
+import os
+import sys
+import tarfile
+
+import numpy as np
+import pytest
+
+ROOT_DIR = os.path.dirname(os.path.dirname(__file__))
+sys.path.append(ROOT_DIR)
+os.chdir(ROOT_DIR)
+
+pytest.importorskip("webdataset")
+pytest.importorskip("cv2")
+Image = pytest.importorskip("PIL.Image")
+
+import torch
+from torch.utils.data import DataLoader
+
+from diffusion_policy.dataset.wds_hand_image_dataset import WdsHandImageDataset
+
+
+def _encode_npy(array):
+    buffer = io.BytesIO()
+    np.save(buffer, array)
+    return buffer.getvalue()
+
+
+def _encode_jpeg(image):
+    buffer = io.BytesIO()
+    Image.fromarray(image).save(buffer, format="JPEG")
+    return buffer.getvalue()
+
+
+def _add_bytes(tar, name, data):
+    info = tarfile.TarInfo(name)
+    info.size = len(data)
+    tar.addfile(info, io.BytesIO(data))
+
+
+def _lowdim(frame_idx):
+    wrist_state = np.zeros(18, dtype=np.float32)
+    wrist_action = np.zeros(18, dtype=np.float32)
+    identity_rot6d = np.array([1, 0, 0, 0, 1, 0], dtype=np.float32)
+    wrist_state[:3] = [frame_idx, 0, 0]
+    wrist_state[3:6] = [0, frame_idx, 0]
+    wrist_state[6:12] = identity_rot6d
+    wrist_state[12:18] = identity_rot6d
+    wrist_action[:3] = [frame_idx + 1, 0, 0]
+    wrist_action[3:6] = [0, frame_idx + 1, 0]
+    wrist_action[6:12] = identity_rot6d
+    wrist_action[12:18] = identity_rot6d
+
+    left_tips = np.array([[frame_idx, 0.1 * i, 0.2] for i in range(5)], dtype=np.float32).reshape(-1)
+    right_tips = np.array([[0.1 * i, frame_idx, 0.3] for i in range(5)], dtype=np.float32).reshape(-1)
+    hand_state = np.concatenate([left_tips, right_tips], axis=0)
+    hand_action = hand_state + 0.01
+    extrinsic = np.eye(4, dtype=np.float32).reshape(-1)
+    intrinsic = np.array([32.0, 32.0, 16.0, 16.0], dtype=np.float32)
+    return np.concatenate(
+        [wrist_state, hand_state, wrist_action, hand_action, extrinsic, intrinsic],
+        axis=0,
+    ).astype(np.float32)
+
+
+def _image(frame_idx, size=32):
+    image = np.zeros((size, size, 3), dtype=np.uint8)
+    image[..., 0] = frame_idx * 20
+    image[..., 1] = np.arange(size, dtype=np.uint8)[:, None]
+    image[..., 2] = np.arange(size, dtype=np.uint8)[None, :]
+    return image
+
+
+def _write_shard(path, n_frames=4, include_instruction=False):
+    with tarfile.open(path, "w") as tar:
+        for frame_idx in range(n_frames):
+            key = f"episode0_{frame_idx:06d}"
+            meta = {
+                "dataset_name": "synthetic",
+                "episode_index": 0,
+            }
+            if include_instruction:
+                meta["instruction"] = ["ignored"]
+                meta["instruction_num"] = 1
+            _add_bytes(tar, f"{key}.meta.json", json.dumps(meta).encode("utf-8"))
+            _add_bytes(tar, f"{key}.lowdim.npy", _encode_npy(_lowdim(frame_idx)))
+            _add_bytes(tar, f"{key}.image.jpg", _encode_jpeg(_image(frame_idx)))
+
+
+def _shape_meta():
+    return {
+        "obs": {
+            "image": {"shape": [3, 32, 32], "type": "rgb"},
+            "state": {"shape": [48], "type": "low_dim"},
+        },
+        "action": {"shape": [48]},
+    }
+
+
+def test_wds_hand_dataset_shapes_and_missing_instruction(tmp_path):
+    shard = tmp_path / "train.tar"
+    _write_shard(shard, n_frames=4, include_instruction=False)
+    dataset = WdsHandImageDataset(
+        shape_meta=_shape_meta(),
+        train_wds_datasets=[{"shard_urls": str(shard)}],
+        val_wds_datasets=[{"shard_urls": str(shard)}],
+        horizon=3,
+        n_obs_steps=2,
+        image_stride=1,
+        state_stride=1,
+        action_stride=1,
+        shuffle_buffer=0,
+        max_normalizer_samples=16,
+    )
+
+    batch = next(iter(DataLoader(dataset, batch_size=2, num_workers=0)))
+    assert batch["obs"]["image"].shape == (2, 2, 3, 32, 32)
+    assert batch["obs"]["state"].shape == (2, 2, 48)
+    assert batch["action"].shape == (2, 3, 48)
+    assert batch["obs"]["image"].dtype == torch.float32
+    assert torch.all(batch["obs"]["image"] >= 0)
+    assert torch.all(batch["obs"]["image"] <= 1)
+
+    normalizer = dataset.get_normalizer()
+    assert set(normalizer.params_dict.keys()) == {"image", "state", "action"}
+
+
+def test_wds_hand_dataset_fixed_shapes_at_episode_tail_with_truncate(tmp_path):
+    shard = tmp_path / "val.tar"
+    _write_shard(shard, n_frames=2, include_instruction=True)
+    dataset = WdsHandImageDataset(
+        shape_meta=_shape_meta(),
+        train_wds_datasets=[{"shard_urls": str(shard)}],
+        val_wds_datasets=[{"shard_urls": str(shard)}],
+        horizon=4,
+        n_obs_steps=3,
+        image_stride=1,
+        state_stride=1,
+        action_stride=1,
+        history_pad_mode="truncate",
+        action_pad_mode="truncate",
+        mode="val",
+        shuffle_buffer=0,
+    )
+
+    samples = list(iter(dataset))
+    assert len(samples) == 2
+    for sample in samples:
+        assert sample["obs"]["image"].shape == (3, 3, 32, 32)
+        assert sample["obs"]["state"].shape == (3, 48)
+        assert sample["action"].shape == (4, 48)
+
+
+def test_wds_hand_batch_policy_compute_loss_smoke(tmp_path):
+    pytest.importorskip("robomimic")
+    pytest.importorskip("diffusers")
+    from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
+
+    from diffusion_policy.policy.diffusion_unet_hybrid_image_policy import DiffusionUnetHybridImagePolicy
+
+    shard = tmp_path / "train.tar"
+    _write_shard(shard, n_frames=4, include_instruction=False)
+    dataset = WdsHandImageDataset(
+        shape_meta=_shape_meta(),
+        train_wds_datasets=[{"shard_urls": str(shard)}],
+        val_wds_datasets=[{"shard_urls": str(shard)}],
+        horizon=3,
+        n_obs_steps=2,
+        image_stride=1,
+        state_stride=1,
+        action_stride=1,
+        shuffle_buffer=0,
+        max_normalizer_samples=16,
+    )
+    batch = next(iter(DataLoader(dataset, batch_size=1, num_workers=0)))
+
+    policy = DiffusionUnetHybridImagePolicy(
+        shape_meta=_shape_meta(),
+        noise_scheduler=DDPMScheduler(
+            num_train_timesteps=2,
+            beta_start=0.0001,
+            beta_end=0.02,
+            beta_schedule="squaredcos_cap_v2",
+            variance_type="fixed_small",
+            clip_sample=True,
+            prediction_type="epsilon",
+        ),
+        horizon=3,
+        n_action_steps=2,
+        n_obs_steps=2,
+        num_inference_steps=2,
+        obs_as_global_cond=True,
+        crop_shape=None,
+        diffusion_step_embed_dim=16,
+        down_dims=[32, 64],
+        kernel_size=3,
+        n_groups=8,
+        cond_predict_scale=True,
+        obs_encoder_group_norm=False,
+        eval_fixed_crop=False,
+    )
+    policy.set_normalizer(dataset.get_normalizer())
+    loss = policy.compute_loss(batch)
+    assert torch.isfinite(loss)
