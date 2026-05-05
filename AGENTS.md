@@ -11,6 +11,7 @@ Primary files:
 - `diffusion_policy/config/train_diffusion_unet_hybrid_wds_workspace.yaml`
 - `tests/test_wds_hand_image_dataset.py`
 - `docs/wds-hand-task.md`
+- `train_torchrun.py`
 
 Key behavior:
 - The task trains `DiffusionUnetHybridImagePolicy`.
@@ -28,14 +29,24 @@ python train.py --config-name=train_diffusion_unet_hybrid_wds_workspace \
   training.device=cuda:0
 ```
 
+Multi-GPU torchrun entrypoint:
+```bash
+torchrun --standalone --nproc_per_node=2 train_torchrun.py \
+  --config-name=train_diffusion_unet_hybrid_wds_workspace \
+  task.train_wds_datasets.0.shard_urls='/path/to/train/shard-*.tar' \
+  task.val_wds_datasets.0.shard_urls='/path/to/val/shard-*.tar'
+```
+
 Implementation notes:
 - `WdsHandImageDataset` is an `IterableDataset`; do not rely on `len(dataloader)`.
 - The WDS workspace uses `training.steps_per_epoch` for scheduler length and epoch boundaries.
+- Under `torchrun`, `TrainDiffusionUnetHybridWdsWorkspace` wraps `policy.compute_loss()` with DDP via `PolicyLossWrapper`; do not call custom policy methods through raw DDP directly.
+- Only rank0 writes wandb logs and checkpoints. All ranks train; rank0 runs validation and sampling while the other ranks wait at barriers.
 - WDS train dataloaders must keep `shuffle: False`; shard/sample shuffling is handled inside the WDS pipeline.
 - There is no env runner or rollout metric for this task. Checkpoint top-k monitors `val_loss` with `mode: min`.
 - Normalizer fitting scans lowdim-only WDS samples and caches stats at `task.dataset.normalizer_cache_path`.
+- Do not directly reuse an EgoVLA normalizer file as `normalizer_cache_path`. EgoVLA normalizers are keyed as `states/actions` or `motions`; this Diffusion Policy task requires `image/state/action`. Refit from the same WDS shards, or write an explicit converter that maps keys and verifies matching transform settings.
 
 Validation status:
 - `python3 -m py_compile diffusion_policy/dataset/wds_hand_image_dataset.py diffusion_policy/workspace/train_diffusion_unet_hybrid_wds_workspace.py tests/test_wds_hand_image_dataset.py` passed on 2026-05-05.
 - The local bare Python used during implementation lacked `pytest`, `omegaconf`, `webdataset`, `cv2`, `PIL`, and `robomimic`, so pytest and Hydra runtime smoke tests still need to be run inside the project conda environment.
-

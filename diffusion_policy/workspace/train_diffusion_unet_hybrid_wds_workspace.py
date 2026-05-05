@@ -15,9 +15,12 @@ import random
 import hydra
 import numpy as np
 import torch
+import torch.distributed as dist
+import torch.nn as nn
 import tqdm
 import wandb
 from omegaconf import OmegaConf
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 
 from diffusion_policy.common.checkpoint_util import TopKCheckpointManager
@@ -32,8 +35,18 @@ from diffusion_policy.workspace.base_workspace import BaseWorkspace
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
 
+class PolicyLossWrapper(nn.Module):
+    def __init__(self, policy: DiffusionUnetHybridImagePolicy):
+        super().__init__()
+        self.policy = policy
+
+    def forward(self, batch):
+        return self.policy.compute_loss(batch)
+
+
 class TrainDiffusionUnetHybridWdsWorkspace(BaseWorkspace):
     include_keys = ["global_step", "epoch"]
+    exclude_keys = ["ddp_model"]
 
     def __init__(self, cfg: OmegaConf, output_dir=None):
         super().__init__(cfg, output_dir=output_dir)
@@ -51,6 +64,41 @@ class TrainDiffusionUnetHybridWdsWorkspace(BaseWorkspace):
         self.optimizer = hydra.utils.instantiate(cfg.optimizer, params=self.model.parameters())
         self.global_step = 0
         self.epoch = 0
+        self.ddp_model = None
+        self.distributed = False
+        self.rank = 0
+        self.world_size = 1
+        self.local_rank = 0
+        self.is_rank0 = True
+
+    def _setup_distributed(self, cfg):
+        self.world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        self.rank = int(os.environ.get("RANK", "0"))
+        self.local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        self.distributed = self.world_size > 1
+        self.is_rank0 = self.rank == 0
+
+        if not self.distributed:
+            return
+
+        if torch.cuda.is_available():
+            torch.cuda.set_device(self.local_rank)
+            cfg.training.device = f"cuda:{self.local_rank}"
+            backend = "nccl"
+        else:
+            cfg.training.device = "cpu"
+            backend = "gloo"
+
+        if not dist.is_initialized():
+            dist.init_process_group(backend=backend, init_method="env://")
+
+    def _barrier(self):
+        if self.distributed and dist.is_initialized():
+            dist.barrier()
+
+    def _cleanup_distributed(self):
+        if self.distributed and dist.is_initialized():
+            dist.destroy_process_group()
 
     @staticmethod
     def _next_batch(iterator, dataloader):
@@ -65,6 +113,7 @@ class TrainDiffusionUnetHybridWdsWorkspace(BaseWorkspace):
 
     def run(self):
         cfg = copy.deepcopy(self.cfg)
+        self._setup_distributed(cfg)
         steps_per_epoch = int(cfg.training.steps_per_epoch)
         if steps_per_epoch <= 0:
             raise ValueError("training.steps_per_epoch must be a positive integer for WDS training.")
@@ -77,7 +126,15 @@ class TrainDiffusionUnetHybridWdsWorkspace(BaseWorkspace):
 
         dataset = hydra.utils.instantiate(cfg.task.dataset)
         train_dataloader = DataLoader(dataset, **cfg.dataloader)
-        normalizer = dataset.get_normalizer()
+        if self.distributed and getattr(dataset, "normalizer_cache_path", None):
+            if self.is_rank0:
+                normalizer = dataset.get_normalizer()
+                self._barrier()
+            else:
+                self._barrier()
+                normalizer = dataset.get_normalizer()
+        else:
+            normalizer = dataset.get_normalizer()
 
         val_dataset = dataset.get_validation_dataset()
         val_dataloader = DataLoader(val_dataset, **cfg.val_dataloader)
@@ -99,12 +156,14 @@ class TrainDiffusionUnetHybridWdsWorkspace(BaseWorkspace):
         if cfg.training.use_ema:
             ema = hydra.utils.instantiate(cfg.ema, model=self.ema_model)
 
-        wandb_run = wandb.init(
-            dir=str(self.output_dir),
-            config=OmegaConf.to_container(cfg, resolve=True),
-            **cfg.logging,
-        )
-        wandb.config.update({"output_dir": self.output_dir})
+        wandb_run = None
+        if self.is_rank0:
+            wandb_run = wandb.init(
+                dir=str(self.output_dir),
+                config=OmegaConf.to_container(cfg, resolve=True),
+                **cfg.logging,
+            )
+            wandb.config.update({"output_dir": self.output_dir})
 
         topk_manager = TopKCheckpointManager(
             save_dir=os.path.join(self.output_dir, "checkpoints"),
@@ -116,6 +175,13 @@ class TrainDiffusionUnetHybridWdsWorkspace(BaseWorkspace):
         if self.ema_model is not None:
             self.ema_model.to(device)
         optimizer_to(self.optimizer, device)
+        if self.distributed:
+            self.ddp_model = DDP(
+                PolicyLossWrapper(self.model),
+                device_ids=[self.local_rank] if device.type == "cuda" else None,
+                output_device=self.local_rank if device.type == "cuda" else None,
+                find_unused_parameters=False,
+            )
 
         train_sampling_batch = None
 
@@ -130,24 +196,45 @@ class TrainDiffusionUnetHybridWdsWorkspace(BaseWorkspace):
 
         train_iter = iter(train_dataloader)
         log_path = os.path.join(self.output_dir, "logs.json.txt")
-        with JsonLogger(log_path) as json_logger:
-            for _ in range(cfg.training.num_epochs):
-                step_log = {}
-                train_losses = []
+        json_logger_context = JsonLogger(log_path) if self.is_rank0 else None
+        if json_logger_context is None:
+            class _NullLogger:
+                def __enter__(self):
+                    return self
 
-                with tqdm.tqdm(
-                    range(steps_per_epoch),
-                    desc=f"Training epoch {self.epoch}",
-                    leave=False,
-                    mininterval=cfg.training.tqdm_interval_sec,
-                ) as tepoch:
-                    for batch_idx in tepoch:
+                def __exit__(self, exc_type, exc, tb):
+                    return False
+
+                def log(self, data):
+                    return None
+
+            json_logger_context = _NullLogger()
+
+        try:
+            with json_logger_context as json_logger:
+                for _ in range(cfg.training.num_epochs):
+                    step_log = {}
+                    train_losses = []
+
+                    iterator = range(steps_per_epoch)
+                    if self.is_rank0:
+                        iterator = tqdm.tqdm(
+                            iterator,
+                            desc=f"Training epoch {self.epoch}",
+                            leave=False,
+                            mininterval=cfg.training.tqdm_interval_sec,
+                        )
+
+                    for batch_idx in iterator:
                         batch, train_iter = self._next_batch(train_iter, train_dataloader)
                         batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
                         if train_sampling_batch is None:
                             train_sampling_batch = batch
 
-                        raw_loss = self.model.compute_loss(batch)
+                        if self.ddp_model is not None:
+                            raw_loss = self.ddp_model(batch)
+                        else:
+                            raw_loss = self.model.compute_loss(batch)
                         loss = raw_loss / cfg.training.gradient_accumulate_every
                         loss.backward()
 
@@ -160,7 +247,8 @@ class TrainDiffusionUnetHybridWdsWorkspace(BaseWorkspace):
                             ema.step(self.model)
 
                         raw_loss_cpu = raw_loss.item()
-                        tepoch.set_postfix(loss=raw_loss_cpu, refresh=False)
+                        if self.is_rank0 and hasattr(iterator, "set_postfix"):
+                            iterator.set_postfix(loss=raw_loss_cpu, refresh=False)
                         train_losses.append(raw_loss_cpu)
                         step_log = {
                             "train_loss": raw_loss_cpu,
@@ -171,59 +259,73 @@ class TrainDiffusionUnetHybridWdsWorkspace(BaseWorkspace):
 
                         is_last_batch = batch_idx == steps_per_epoch - 1
                         if not is_last_batch:
-                            wandb_run.log(step_log, step=self.global_step)
-                            json_logger.log(step_log)
+                            if self.is_rank0:
+                                wandb_run.log(step_log, step=self.global_step)
+                                json_logger.log(step_log)
                             self.global_step += 1
 
-                step_log["train_loss"] = float(np.mean(train_losses))
+                    epoch_train_loss = torch.tensor(
+                        float(np.mean(train_losses)),
+                        device=device,
+                        dtype=torch.float32,
+                    )
+                    if self.distributed:
+                        dist.all_reduce(epoch_train_loss, op=dist.ReduceOp.AVG)
+                    step_log["train_loss"] = epoch_train_loss.item()
 
-                policy = self.ema_model if cfg.training.use_ema else self.model
-                policy.eval()
+                    self._barrier()
+                    if self.is_rank0:
+                        policy = self.ema_model if cfg.training.use_ema else self.model
+                        policy.eval()
 
-                if (self.epoch % cfg.training.val_every) == 0:
-                    val_losses = []
-                    with torch.no_grad():
-                        with tqdm.tqdm(
-                            val_dataloader,
-                            desc=f"Validation epoch {self.epoch}",
-                            leave=False,
-                            mininterval=cfg.training.tqdm_interval_sec,
-                        ) as tepoch:
-                            for batch_idx, batch in enumerate(tepoch):
-                                batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
-                                val_losses.append(self.model.compute_loss(batch))
-                                if (
-                                    cfg.training.max_val_steps is not None
-                                    and batch_idx >= cfg.training.max_val_steps - 1
-                                ):
-                                    break
-                    if val_losses:
-                        step_log["val_loss"] = torch.mean(torch.stack(val_losses)).item()
+                        if (self.epoch % cfg.training.val_every) == 0:
+                            val_losses = []
+                            with torch.no_grad():
+                                with tqdm.tqdm(
+                                    val_dataloader,
+                                    desc=f"Validation epoch {self.epoch}",
+                                    leave=False,
+                                    mininterval=cfg.training.tqdm_interval_sec,
+                                ) as tepoch:
+                                    for batch_idx, batch in enumerate(tepoch):
+                                        batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
+                                        val_losses.append(self.model.compute_loss(batch))
+                                        if (
+                                            cfg.training.max_val_steps is not None
+                                            and batch_idx >= cfg.training.max_val_steps - 1
+                                        ):
+                                            break
+                            if val_losses:
+                                step_log["val_loss"] = torch.mean(torch.stack(val_losses)).item()
 
-                if (self.epoch % cfg.training.sample_every) == 0 and train_sampling_batch is not None:
-                    with torch.no_grad():
-                        batch = dict_apply(train_sampling_batch, lambda x: x.to(device, non_blocking=True))
-                        result = policy.predict_action(batch["obs"])
-                        mse = torch.nn.functional.mse_loss(result["action_pred"], batch["action"])
-                        step_log["train_action_mse_error"] = mse.item()
+                        if (self.epoch % cfg.training.sample_every) == 0 and train_sampling_batch is not None:
+                            with torch.no_grad():
+                                batch = dict_apply(train_sampling_batch, lambda x: x.to(device, non_blocking=True))
+                                result = policy.predict_action(batch["obs"])
+                                mse = torch.nn.functional.mse_loss(result["action_pred"], batch["action"])
+                                step_log["train_action_mse_error"] = mse.item()
 
-                if (self.epoch % cfg.training.checkpoint_every) == 0:
-                    if cfg.checkpoint.save_last_ckpt:
-                        self.save_checkpoint()
-                    if cfg.checkpoint.save_last_snapshot:
-                        self.save_snapshot()
+                        if (self.epoch % cfg.training.checkpoint_every) == 0:
+                            if cfg.checkpoint.save_last_ckpt:
+                                self.save_checkpoint()
+                            if cfg.checkpoint.save_last_snapshot:
+                                self.save_snapshot()
 
-                    metric_dict = {key.replace("/", "_"): value for key, value in step_log.items()}
-                    if cfg.checkpoint.topk.monitor_key in metric_dict:
-                        topk_ckpt_path = topk_manager.get_ckpt_path(metric_dict)
-                        if topk_ckpt_path is not None:
-                            self.save_checkpoint(path=topk_ckpt_path)
+                            metric_dict = {key.replace("/", "_"): value for key, value in step_log.items()}
+                            if cfg.checkpoint.topk.monitor_key in metric_dict:
+                                topk_ckpt_path = topk_manager.get_ckpt_path(metric_dict)
+                                if topk_ckpt_path is not None:
+                                    self.save_checkpoint(path=topk_ckpt_path)
 
-                policy.train()
-                wandb_run.log(step_log, step=self.global_step)
-                json_logger.log(step_log)
-                self.global_step += 1
-                self.epoch += 1
+                        policy.train()
+                        wandb_run.log(step_log, step=self.global_step)
+                        json_logger.log(step_log)
+
+                    self._barrier()
+                    self.global_step += 1
+                    self.epoch += 1
+        finally:
+            self._cleanup_distributed()
 
 
 @hydra.main(
