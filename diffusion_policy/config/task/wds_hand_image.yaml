@@ -14,12 +14,12 @@ shape_meta: &shape_meta
     shape: [48]
 
 train_wds_datasets: &train_wds_datasets
-  - name: train
-    shard_urls: data/wds/train/shard-*.tar
+  - name: fold_paper_box_and_putting_object_inside_recover_train
+    shard_urls: /share_data/yeyuyao/real_world_finetune_corrected/folding_paper_box_and_putting_object_inside_recover_0505/train/shard-*.tar
 
 val_wds_datasets: &val_wds_datasets
-  - name: val
-    shard_urls: data/wds/val/shard-*.tar
+  - name: fold_paper_box_and_putting_object_inside_recover_val
+    shard_urls: /share_data/yeyuyao/real_world_finetune_corrected/folding_paper_box_and_putting_object_inside_recover_0505/val/shard-*.tar
 
 dataset:
   _target_: diffusion_policy.dataset.wds_hand_image_dataset.WdsHandImageDataset
