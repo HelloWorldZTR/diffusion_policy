@@ -5,7 +5,8 @@ This document describes the WDS hand/fingertip task added on 2026-05-05. It is a
 ## What It Trains
 
 The task uses `DiffusionUnetHybridImagePolicy` to predict future hand motion from:
-- RGB image history: `obs.image`
+- head RGB image history: `obs.image`
+- breast/chest RGB image history: `obs.breast_image`
 - self state history: `obs.state`
 
 The model predicts:
@@ -13,6 +14,7 @@ The model predicts:
 
 Tensor contract after collation:
 - `obs.image`: `[B, n_obs_steps, 3, H, W]`, float32 in `[0, 1]`
+- `obs.breast_image`: `[B, n_obs_steps, 3, H, W]`, float32 in `[0, 1]`
 - `obs.state`: `[B, n_obs_steps, 48]`, float32
 - `action`: `[B, horizon, 48]`, float32
 
@@ -28,6 +30,7 @@ Each WDS frame sample is expected to contain:
 - `<key>.meta.json`
 - `<key>.lowdim.npy`
 - `<key>.image.jpg`
+- `<key>.breast_image.jpg`
 
 `lowdim.npy` must follow the EgoVLA base layout:
 - `0:18`: `wrist_state`
@@ -83,14 +86,14 @@ The current Diffusion Policy WDS task does not directly load an EgoVLA normalize
 
 Why:
 - EgoVLA normalizer fitting is built around low-level keys named `states` / `actions` when `use_relative_action=True`, or `motions` when `use_relative_action=False`.
-- This Diffusion Policy adapter must provide normalizer keys matching the policy batch contract: `image`, `state`, and `action`.
-- The DP policy calls `normalizer.normalize(batch["obs"])`, so `obs.state` needs a `state` entry and `obs.image` needs an `image` entry.
+- This Diffusion Policy adapter must provide normalizer keys matching the policy batch contract: `image`, `breast_image`, `state`, and `action`.
+- The DP policy calls `normalizer.normalize(batch["obs"])`, so `obs.image`, `obs.breast_image`, and `obs.state` all need matching normalizer entries.
 - EgoVLA's normalizer utility applies an `ignore_dim` policy to wrist rot6d dimensions. The DP WDS adapter matches that behavior for `state` and `action` dimensions `6:18`.
 
 What can be reused:
 - Reuse the same WDS shards and the same EgoVLA-style state/action transform. This is what `WdsHandImageDataset.get_normalizer()` already does.
 - Reuse the idea of separate `states` and `actions` statistics, but regenerate them into DP's key names and cache format.
-- If an existing EgoVLA normalizer must be reused, add a small conversion step that maps `states -> state`, `actions -> action`, adds `image -> get_image_range_normalizer()`, and verifies that the source normalizer was fitted with the same `use_relative_action`, horizons, strides, hand dimensions, and transform code. Do not point `task.dataset.normalizer_cache_path` at an EgoVLA checkpoint without this conversion.
+- If an existing EgoVLA normalizer must be reused, add a small conversion step that maps `states -> state`, `actions -> action`, adds `image` / `breast_image -> get_image_range_normalizer()`, and verifies that the source normalizer was fitted with the same `use_relative_action`, horizons, strides, hand dimensions, and transform code. Do not point `task.dataset.normalizer_cache_path` at an EgoVLA checkpoint without this conversion.
 
 Recommended default:
 - Let this repo fit and cache its own normalizer at `task.dataset.normalizer_cache_path`.
@@ -143,7 +146,7 @@ torchrun --standalone --nproc_per_node=2 train_torchrun.py \
 
 The WDS workspace detects `WORLD_SIZE`, `RANK`, and `LOCAL_RANK` from torchrun. Rank0 writes wandb logs and checkpoints; all ranks train. Rank0 runs validation and train-sample action MSE while other ranks wait at distributed barriers.
 
-Both WDS workspaces use the Diffusion Policy batch schema `obs.image`, `obs.state`, and `action`. They reuse EgoVLA sliding windows and lowdim transforms, but they do not consume LegendVLA's collated `images`, `states`, `actions`, or `actions_valid_mask` keys.
+Both WDS workspaces use the Diffusion Policy batch schema `obs.image`, `obs.breast_image`, `obs.state`, and `action`. They reuse EgoVLA sliding windows and lowdim transforms, but they do not consume LegendVLA's collated `images`, `states`, `actions`, or `actions_valid_mask` keys.
 
 For a short smoke run:
 ```bash
@@ -166,16 +169,21 @@ Synthetic WDS tests live in:
 
 Intended checks:
 - Missing instruction metadata does not fail.
+- Missing `breast_image.jpg` fails because the WDS hand task is dual-image only.
 - Dataset batches have Diffusion Policy-compatible shapes.
 - Episode tail windows keep fixed tensor shapes under truncate padding.
 - Optional policy smoke test runs `compute_loss()` when `robomimic` and `diffusers` are installed.
 
-Known verification status on 2026-05-06:
+Known verification status on 2026-05-06 after the dual-image conversion:
 - Static compile passed:
   ```bash
-  python3 -m py_compile diffusion_policy/dataset/wds_hand_image_dataset.py diffusion_policy/workspace/train_diffusion_unet_hybrid_wds_workspace.py diffusion_policy/workspace/train_diffusion_transformer_hybrid_wds_workspace.py tests/test_wds_hand_image_dataset.py tests/generate_wds_hand_normalizer.py
+  python3 -m py_compile diffusion_policy/dataset/wds_hand_image_dataset.py tests/test_wds_hand_image_dataset.py tests/export_wds_hand_window.py tests/generate_wds_hand_normalizer.py
   ```
-- Runtime pytest was not executed in the implementation shell because that bare Python lacked `pytest`, `omegaconf`, `webdataset`, `cv2`, `PIL`, and `robomimic`.
+- Dataset/config pytest passed in the available `VLM` conda environment:
+  ```bash
+  conda run -n VLM python -m pytest -q tests/test_wds_hand_image_dataset.py
+  ```
+- Result: 6 passed, 2 skipped. The skipped policy smoke tests require `robomimic` and `diffusers`.
 
 Run the full WDS tests inside the project environment:
 ```bash
@@ -186,6 +194,6 @@ python -m pytest -q tests/test_wds_hand_image_dataset.py
 
 - This is an offline training path only; there is no simulator or real robot env runner.
 - Top-k checkpoints depend on validation producing `val_loss`; keep `val_wds_datasets` configured.
-- The adapter assumes head-camera WDS data compatible with EgoVLA `wds_dataset.py`.
+- The adapter assumes head and breast/chest WDS image data compatible with EgoVLA `wds_dataset.py`.
 - The root `external/EgoVLA` checkout is required because the adapter reuses its WDS sliding-window utilities.
 - DDP support is currently implemented for the WDS hybrid workspace path, not for every legacy workspace in the repo.

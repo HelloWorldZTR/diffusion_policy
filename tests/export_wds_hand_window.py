@@ -7,9 +7,11 @@ Example:
       --window-index 0
 
 Outputs are written under outputs/wds_hand_windows/<timestamp>/ by default:
-    - contact_sheet.png: all observation frames in one image
-    - obs_image_*.png: decoded observation image frames
-    - window.npz: obs image/state/action arrays, unless --images-only is set
+    - obs_image_contact_sheet.png: all head observation frames in one image
+    - obs_breast_image_contact_sheet.png: all breast observation frames in one image
+    - obs_image_*.png: decoded head observation image frames
+    - obs_breast_image_*.png: decoded breast observation image frames
+    - window.npz: obs image/breast_image/state/action arrays, unless --images-only is set
     - summary.json: shapes, dtypes, min/max, source args
 """
 
@@ -71,6 +73,7 @@ def build_shape_meta(height, width):
     return {
         "obs": {
             "image": {"shape": [3, height, width], "type": "rgb"},
+            "breast_image": {"shape": [3, height, width], "type": "rgb"},
             "state": {"shape": [48], "type": "low_dim"},
         },
         "action": {"shape": [48]},
@@ -103,7 +106,7 @@ def summarize_array(name, array):
     return name, summary
 
 
-def save_obs_images(obs_image, output_dir):
+def save_obs_images(obs_image, output_dir, prefix="obs_image"):
     # obs_image: [T, C, H, W], float in [0, 1]
     import cv2
 
@@ -111,13 +114,13 @@ def save_obs_images(obs_image, output_dir):
     frames = np.moveaxis(obs_image, 1, -1)
     frames = np.clip(frames * 255.0, 0, 255).astype(np.uint8)
     for idx, frame in enumerate(frames):
-        path = output_dir / f"obs_image_{idx:02d}.png"
+        path = output_dir / f"{prefix}_{idx:02d}.png"
         cv2.imwrite(str(path), cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
         paths.append(str(path))
 
     if len(frames) > 0:
         sheet = np.concatenate(frames, axis=1)
-        sheet_path = output_dir / "contact_sheet.png"
+        sheet_path = output_dir / f"{prefix}_contact_sheet.png"
         cv2.imwrite(str(sheet_path), cv2.cvtColor(sheet, cv2.COLOR_RGB2BGR))
         paths.insert(0, str(sheet_path))
     return paths
@@ -154,6 +157,7 @@ def main():
         raise RuntimeError(f"No window found at index {args.window_index} for shards={args.shards!r}")
 
     obs_image = to_numpy(sample["obs"]["image"][0])
+    obs_breast_image = to_numpy(sample["obs"]["breast_image"][0])
     obs_state = to_numpy(sample["obs"]["state"][0])
     action = to_numpy(sample["action"][0])
 
@@ -169,19 +173,23 @@ def main():
         np.savez_compressed(
             npz_path,
             obs_image=obs_image,
+            obs_breast_image=obs_breast_image,
             obs_state=obs_state,
             action=action,
         )
-    image_paths = save_obs_images(obs_image, output_dir)
+    image_paths = save_obs_images(obs_image, output_dir, prefix="obs_image")
+    breast_image_paths = save_obs_images(obs_breast_image, output_dir, prefix="obs_breast_image")
 
     summary = {
         "args": vars(args),
         "window_index": args.window_index,
         "npz_path": str(npz_path) if npz_path is not None else None,
         "image_paths": image_paths,
+        "breast_image_paths": breast_image_paths,
         "arrays": dict(
             [
                 summarize_array("obs_image", obs_image),
+                summarize_array("obs_breast_image", obs_breast_image),
                 summarize_array("obs_state", obs_state),
                 summarize_array("action", action),
             ]

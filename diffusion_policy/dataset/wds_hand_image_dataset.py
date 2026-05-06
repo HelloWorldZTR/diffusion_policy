@@ -74,6 +74,7 @@ NORMALIZER_METADATA_COMPARE_KEYS = (
     "normalizer_datasets",
     "expanded_shard_urls",
     "expanded_shard_count",
+    "normalizer_keys",
 )
 
 
@@ -122,8 +123,9 @@ def _normalizer_with_ignored_dim(stat: Dict[str, np.ndarray], ignore_dim: Option
     if ignore_dim is None:
         return normalizer
     params = normalizer.params_dict
-    params["scale"][ignore_dim] = 1.0
-    params["offset"][ignore_dim] = 0.0
+    with torch.no_grad():
+        params["scale"][ignore_dim] = 1.0
+        params["offset"][ignore_dim] = 0.0
     ignored_dim_mask = torch.zeros_like(params["scale"])
     ignored_dim_mask[ignore_dim] = 1.0
     params["ignored_dim_mask"] = torch.nn.Parameter(ignored_dim_mask, requires_grad=False)
@@ -400,13 +402,28 @@ class WdsHandImageDataset(torch.utils.data.IterableDataset):
         self.normalizer_cache_mode = normalizer_cache_mode
         self.normalizer_match_egovla_rot6d = bool(normalizer_match_egovla_rot6d)
 
-        image_shape = tuple(shape_meta["obs"]["image"]["shape"])
-        if len(image_shape) != 3 or image_shape[0] != 3:
-            raise ValueError(f"shape_meta.obs.image.shape must be [3,H,W], got {image_shape}")
-        self.image_hw = (int(image_shape[1]), int(image_shape[2]))
+        self.rgb_keys = []
+        self.image_hw_by_key = {}
+        for key, attr in shape_meta["obs"].items():
+            obs_type = attr.get("type", "low_dim")
+            if obs_type != "rgb":
+                continue
+            image_shape = tuple(attr["shape"])
+            if len(image_shape) != 3 or image_shape[0] != 3:
+                raise ValueError(f"shape_meta.obs.{key}.shape must be [3,H,W], got {image_shape}")
+            self.rgb_keys.append(str(key))
+            self.image_hw_by_key[str(key)] = (int(image_shape[1]), int(image_shape[2]))
+        required_rgb_keys = {"image", "breast_image"}
+        missing_rgb_keys = required_rgb_keys - set(self.rgb_keys)
+        if missing_rgb_keys:
+            raise ValueError(
+                "WdsHandImageDataset dual-image mode requires rgb obs keys "
+                f"{sorted(required_rgb_keys)}, missing {sorted(missing_rgb_keys)}"
+            )
         action_shape = tuple(shape_meta["action"]["shape"])
         if action_shape != (48,):
             raise ValueError(f"shape_meta.action.shape must be [48], got {action_shape}")
+        self.normalizer_keys = [*self.rgb_keys, "state", "action"]
 
         self.window_config = WindowConfig(
             action_horizon=self.horizon,
@@ -446,7 +463,7 @@ class WdsHandImageDataset(torch.utils.data.IterableDataset):
                 workersplitter=no_split if is_train else wds.shardlists.split_by_worker,
                 resampled=is_train,
                 empty_check=False,
-                select_files=build_select_files(load_image=load_image, load_depth=False, load_breast=False),
+                select_files=build_select_files(load_image=load_image, load_depth=False, load_breast=load_image),
             ),
             wds.map(decode_sample_fields),
             wds.map(_ensure_instruction_meta),
@@ -467,8 +484,8 @@ class WdsHandImageDataset(torch.utils.data.IterableDataset):
             stages.append(wds.map(preprocess_fn))
         return wds.DataPipeline(*stages)
 
-    def _resize_image_sequence(self, images: np.ndarray) -> np.ndarray:
-        target_h, target_w = self.image_hw
+    def _resize_image_sequence(self, images: np.ndarray, key: str) -> np.ndarray:
+        target_h, target_w = self.image_hw_by_key[key]
         if images.shape[1] == target_h and images.shape[2] == target_w:
             return images
         import cv2
@@ -477,6 +494,18 @@ class WdsHandImageDataset(torch.utils.data.IterableDataset):
             [cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_AREA) for frame in images],
             axis=0,
         )
+
+    def _prepare_image_obs(self, sample: Dict, key: str) -> np.ndarray:
+        if key not in sample:
+            raise KeyError(
+                f"Dual-image WDS hand task requires sample[{key!r}]. "
+                "Check that shards contain breast_image.jpg and that load_breast=True is used."
+            )
+        image = sample[key].astype(np.uint8)
+        image = _pad_first_axis(image, self.n_obs_steps)
+        image = self._resize_image_sequence(image, key)
+        image = np.moveaxis(image, -1, 1).astype(np.float32) / 255.0
+        return image.astype(np.float32)
 
     def _sample_to_dp(self, sample: Dict) -> Dict[str, torch.Tensor]:
         state, action = process_wds_state_action(
@@ -490,16 +519,10 @@ class WdsHandImageDataset(torch.utils.data.IterableDataset):
         state = _pad_first_axis(state, self.n_obs_steps)
         action = _pad_first_axis(action, self.horizon)
 
-        image = sample["image"].astype(np.uint8)
-        image = _pad_first_axis(image, self.n_obs_steps)
-        image = self._resize_image_sequence(image)
-        image = np.moveaxis(image, -1, 1).astype(np.float32) / 255.0
-
+        obs = {key: self._prepare_image_obs(sample, key) for key in self.rgb_keys}
+        obs["state"] = state.astype(np.float32)
         data = {
-            "obs": {
-                "image": image.astype(np.float32),
-                "state": state.astype(np.float32),
-            },
+            "obs": obs,
             "action": action.astype(np.float32),
         }
         return dict_apply(data, lambda x: torch.from_numpy(x) if isinstance(x, np.ndarray) else x)
@@ -565,6 +588,7 @@ class WdsHandImageDataset(torch.utils.data.IterableDataset):
             "expanded_shard_urls": [os.fspath(x) for x in expanded_shards],
             "expanded_shard_count": len(expanded_shards),
             "normalizer_max_rows": self.normalizer_max_rows,
+            "normalizer_keys": list(self.normalizer_keys),
         }
 
     def _metadata_mismatch_reason(self, actual: Dict[str, Any], expected: Dict[str, Any]) -> Optional[str]:
@@ -608,6 +632,14 @@ class WdsHandImageDataset(torch.utils.data.IterableDataset):
         # Backward compatibility for the first WDS adapter cache format, which
         # saved only LinearNormalizer.state_dict() and has no metadata.
         normalizer.load_state_dict(payload)
+        expected_keys = set(expected_metadata["normalizer_keys"])
+        actual_keys = set(normalizer.params_dict.keys())
+        if actual_keys != expected_keys:
+            reason = f"normalizer_keys: cache={sorted(actual_keys)!r} current={sorted(expected_keys)!r}"
+            if self.normalizer_cache_mode == "readonly":
+                raise RuntimeError(f"Legacy WDS normalizer cache metadata mismatch ({reason}).")
+            warnings.warn(f"Regenerating legacy WDS normalizer cache because metadata mismatched ({reason}).")
+            return None
         warnings.warn(
             "Loaded legacy WDS normalizer cache without metadata validation. "
             "Run with normalizer_cache_mode=refresh to rewrite it in the new format."
@@ -666,7 +698,8 @@ class WdsHandImageDataset(torch.utils.data.IterableDataset):
             "action": action_stats.to_stats(),
         }
         normalizer = LinearNormalizer()
-        normalizer["image"] = get_image_range_normalizer()
+        for key in self.rgb_keys:
+            normalizer[key] = get_image_range_normalizer()
         ignore_dim = EGOVLA_WRIST_ROT6D_SLICE if self.normalizer_match_egovla_rot6d else None
         normalizer["state"] = _normalizer_with_ignored_dim(stats["state"], ignore_dim=ignore_dim)
         normalizer["action"] = _normalizer_with_ignored_dim(stats["action"], ignore_dim=ignore_dim)
@@ -679,7 +712,7 @@ class WdsHandImageDataset(torch.utils.data.IterableDataset):
                     "state": state_stats.count,
                     "action": action_stats.count,
                 },
-                "normalizer_keys": ["image", "state", "action"],
+                "normalizer_keys": list(self.normalizer_keys),
             }
         )
         return normalizer, stats, metadata

@@ -72,7 +72,7 @@ def _image(frame_idx, size=32):
     return image
 
 
-def _write_shard(path, n_frames=4, include_instruction=False):
+def _write_shard(path, n_frames=4, include_instruction=False, include_breast=True, image_size=32):
     with tarfile.open(path, "w") as tar:
         for frame_idx in range(n_frames):
             key = f"episode0_{frame_idx:06d}"
@@ -85,13 +85,20 @@ def _write_shard(path, n_frames=4, include_instruction=False):
                 meta["instruction_num"] = 1
             _add_bytes(tar, f"{key}.meta.json", json.dumps(meta).encode("utf-8"))
             _add_bytes(tar, f"{key}.lowdim.npy", _encode_npy(_lowdim(frame_idx)))
-            _add_bytes(tar, f"{key}.image.jpg", _encode_jpeg(_image(frame_idx)))
+            _add_bytes(tar, f"{key}.image.jpg", _encode_jpeg(_image(frame_idx, size=image_size)))
+            if include_breast:
+                _add_bytes(
+                    tar,
+                    f"{key}.breast_image.jpg",
+                    _encode_jpeg(_image(frame_idx + 7, size=image_size)),
+                )
 
 
-def _shape_meta():
+def _shape_meta(image_size=32):
     return {
         "obs": {
-            "image": {"shape": [3, 32, 32], "type": "rgb"},
+            "image": {"shape": [3, image_size, image_size], "type": "rgb"},
+            "breast_image": {"shape": [3, image_size, image_size], "type": "rgb"},
             "state": {"shape": [48], "type": "low_dim"},
         },
         "action": {"shape": [48]},
@@ -116,14 +123,18 @@ def test_wds_hand_dataset_shapes_and_missing_instruction(tmp_path):
 
     batch = next(iter(DataLoader(dataset, batch_size=2, num_workers=0)))
     assert batch["obs"]["image"].shape == (2, 2, 3, 32, 32)
+    assert batch["obs"]["breast_image"].shape == (2, 2, 3, 32, 32)
     assert batch["obs"]["state"].shape == (2, 2, 48)
     assert batch["action"].shape == (2, 3, 48)
     assert batch["obs"]["image"].dtype == torch.float32
+    assert batch["obs"]["breast_image"].dtype == torch.float32
     assert torch.all(batch["obs"]["image"] >= 0)
     assert torch.all(batch["obs"]["image"] <= 1)
+    assert torch.all(batch["obs"]["breast_image"] >= 0)
+    assert torch.all(batch["obs"]["breast_image"] <= 1)
 
     normalizer = dataset.get_normalizer()
-    assert set(normalizer.params_dict.keys()) == {"image", "state", "action"}
+    assert set(normalizer.params_dict.keys()) == {"image", "breast_image", "state", "action"}
     assert torch.allclose(normalizer["state"].params_dict["scale"][6:18], torch.ones(12))
     assert torch.allclose(normalizer["state"].params_dict["offset"][6:18], torch.zeros(12))
     assert torch.allclose(normalizer["action"].params_dict["scale"][6:18], torch.ones(12))
@@ -166,18 +177,18 @@ def test_wds_hand_normalizer_cache_payload_modes_and_legacy_load(tmp_path):
     normalizer = dataset.get_normalizer()
     payload = torch.load(cache, map_location="cpu")
     assert set(payload.keys()) == {"schema_version", "normalizer_state_dict", "stats", "metadata"}
-    assert payload["metadata"]["normalizer_keys"] == ["image", "state", "action"]
+    assert payload["metadata"]["normalizer_keys"] == ["image", "breast_image", "state", "action"]
     assert payload["metadata"]["effective_rows"]["state"] > 0
     assert payload["metadata"]["effective_rows"]["action"] > 0
 
     reloaded = dataset.get_normalizer()
-    assert set(reloaded.params_dict.keys()) == {"image", "state", "action"}
+    assert set(reloaded.params_dict.keys()) == {"image", "breast_image", "state", "action"}
 
     stale_payload = torch.load(cache, map_location="cpu")
     stale_payload["metadata"]["use_relative_action"] = False
     torch.save(stale_payload, cache)
     regenerated = dataset.get_normalizer()
-    assert set(regenerated.params_dict.keys()) == {"image", "state", "action"}
+    assert set(regenerated.params_dict.keys()) == {"image", "breast_image", "state", "action"}
     assert torch.load(cache, map_location="cpu")["metadata"]["use_relative_action"] is True
 
     stale_payload = torch.load(cache, map_location="cpu")
@@ -204,7 +215,7 @@ def test_wds_hand_normalizer_cache_payload_modes_and_legacy_load(tmp_path):
     )
     with pytest.warns(UserWarning, match="legacy WDS normalizer cache"):
         legacy = legacy_dataset.get_normalizer()
-    assert set(legacy.params_dict.keys()) == {"image", "state", "action"}
+    assert set(legacy.params_dict.keys()) == {"image", "breast_image", "state", "action"}
 
 
 def test_wds_hand_dataset_fixed_shapes_at_episode_tail_with_truncate(tmp_path):
@@ -229,8 +240,28 @@ def test_wds_hand_dataset_fixed_shapes_at_episode_tail_with_truncate(tmp_path):
     assert len(samples) == 2
     for sample in samples:
         assert sample["obs"]["image"].shape == (3, 3, 32, 32)
+        assert sample["obs"]["breast_image"].shape == (3, 3, 32, 32)
         assert sample["obs"]["state"].shape == (3, 48)
         assert sample["action"].shape == (4, 48)
+
+
+def test_wds_hand_dataset_requires_breast_image(tmp_path):
+    shard = tmp_path / "missing_breast.tar"
+    _write_shard(shard, n_frames=4, include_instruction=False, include_breast=False)
+    dataset = WdsHandImageDataset(
+        shape_meta=_shape_meta(),
+        train_wds_datasets=[{"shard_urls": str(shard)}],
+        val_wds_datasets=[{"shard_urls": str(shard)}],
+        horizon=3,
+        n_obs_steps=2,
+        image_stride=1,
+        state_stride=1,
+        action_stride=1,
+        shuffle_buffer=0,
+    )
+
+    with pytest.raises(KeyError, match="breast_image"):
+        next(iter(dataset))
 
 
 def test_wds_hand_batch_policy_compute_loss_smoke(tmp_path):
@@ -241,9 +272,10 @@ def test_wds_hand_batch_policy_compute_loss_smoke(tmp_path):
     from diffusion_policy.policy.diffusion_unet_hybrid_image_policy import DiffusionUnetHybridImagePolicy
 
     shard = tmp_path / "train.tar"
-    _write_shard(shard, n_frames=4, include_instruction=False)
+    _write_shard(shard, n_frames=4, include_instruction=False, image_size=64)
+    shape_meta = _shape_meta(image_size=64)
     dataset = WdsHandImageDataset(
-        shape_meta=_shape_meta(),
+        shape_meta=shape_meta,
         train_wds_datasets=[{"shard_urls": str(shard)}],
         val_wds_datasets=[{"shard_urls": str(shard)}],
         horizon=3,
@@ -257,7 +289,7 @@ def test_wds_hand_batch_policy_compute_loss_smoke(tmp_path):
     batch = next(iter(DataLoader(dataset, batch_size=1, num_workers=0)))
 
     policy = DiffusionUnetHybridImagePolicy(
-        shape_meta=_shape_meta(),
+        shape_meta=shape_meta,
         noise_scheduler=DDPMScheduler(
             num_train_timesteps=2,
             beta_start=0.0001,
@@ -272,14 +304,14 @@ def test_wds_hand_batch_policy_compute_loss_smoke(tmp_path):
         n_obs_steps=2,
         num_inference_steps=2,
         obs_as_global_cond=True,
-        crop_shape=None,
+        crop_shape=(56, 56),
         diffusion_step_embed_dim=16,
         down_dims=[32, 64],
         kernel_size=3,
         n_groups=8,
         cond_predict_scale=True,
         obs_encoder_group_norm=False,
-        eval_fixed_crop=False,
+        eval_fixed_crop=True,
     )
     policy.set_normalizer(dataset.get_normalizer())
     loss = policy.compute_loss(batch)
@@ -306,6 +338,8 @@ def test_wds_transformer_hybrid_config_smoke():
     assert cfg.checkpoint.topk.monitor_key == "val_loss"
     assert cfg.checkpoint.topk.mode == "min"
     assert int(cfg.training.steps_per_epoch) > 0
+    assert "breast_image" in cfg.task.shape_meta.obs
+    assert list(cfg.policy.crop_shape) == [216, 216]
 
 
 def test_wds_hand_batch_transformer_policy_compute_loss_smoke(tmp_path):
@@ -316,9 +350,10 @@ def test_wds_hand_batch_transformer_policy_compute_loss_smoke(tmp_path):
     from diffusion_policy.policy.diffusion_transformer_hybrid_image_policy import DiffusionTransformerHybridImagePolicy
 
     shard = tmp_path / "train.tar"
-    _write_shard(shard, n_frames=4, include_instruction=False)
+    _write_shard(shard, n_frames=4, include_instruction=False, image_size=64)
+    shape_meta = _shape_meta(image_size=64)
     dataset = WdsHandImageDataset(
-        shape_meta=_shape_meta(),
+        shape_meta=shape_meta,
         train_wds_datasets=[{"shard_urls": str(shard)}],
         val_wds_datasets=[{"shard_urls": str(shard)}],
         horizon=3,
@@ -332,7 +367,7 @@ def test_wds_hand_batch_transformer_policy_compute_loss_smoke(tmp_path):
     batch = next(iter(DataLoader(dataset, batch_size=1, num_workers=0)))
 
     policy = DiffusionTransformerHybridImagePolicy(
-        shape_meta=_shape_meta(),
+        shape_meta=shape_meta,
         noise_scheduler=DDPMScheduler(
             num_train_timesteps=2,
             beta_start=0.0001,
@@ -346,9 +381,9 @@ def test_wds_hand_batch_transformer_policy_compute_loss_smoke(tmp_path):
         n_action_steps=2,
         n_obs_steps=2,
         num_inference_steps=2,
-        crop_shape=None,
+        crop_shape=(56, 56),
         obs_encoder_group_norm=False,
-        eval_fixed_crop=False,
+        eval_fixed_crop=True,
         n_layer=2,
         n_cond_layers=0,
         n_head=2,

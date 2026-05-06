@@ -7,6 +7,9 @@ shape_meta: &shape_meta
     image:
       shape: *image_shape
       type: rgb
+    breast_image:
+      shape: *image_shape
+      type: rgb
     state:
       shape: [48]
       type: low_dim
