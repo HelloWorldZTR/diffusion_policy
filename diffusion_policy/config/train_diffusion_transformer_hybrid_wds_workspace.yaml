@@ -37,14 +37,15 @@ policy:
   n_obs_steps: ${n_obs_steps}
   num_inference_steps: 100
 
-  crop_shape: [216, 216]
+  resize_shape: [240, 320]
+  crop_shape: [216, 288] # ch, cw 240x320 90%
   obs_encoder_group_norm: True
   eval_fixed_crop: True
 
   n_layer: 8
   n_cond_layers: 0
   n_head: 4
-  n_emb: 256
+  n_emb: 768
   p_drop_emb: 0.0
   p_drop_attn: 0.3
   causal_attn: True

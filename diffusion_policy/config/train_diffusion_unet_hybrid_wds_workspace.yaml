@@ -35,6 +35,9 @@ policy:
   n_obs_steps: ${n_obs_steps}
   num_inference_steps: 100
   obs_as_global_cond: ${obs_as_global_cond}
+
+  # same as in Appendix A.4
+  resize_shape: [240, 320]
   crop_shape: [216, 216]
   diffusion_step_embed_dim: 128
   down_dims: [512, 1024, 2048]
