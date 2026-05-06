@@ -58,6 +58,7 @@ Task config:
 
 Training config:
 - `diffusion_policy/config/train_diffusion_unet_hybrid_wds_workspace.yaml`
+- `diffusion_policy/config/train_diffusion_transformer_hybrid_wds_workspace.yaml`
 
 Important defaults:
 - image shape: `[3, 224, 224]`
@@ -120,10 +121,20 @@ python train.py --config-name=train_diffusion_unet_hybrid_wds_workspace \
   training.device=cuda:0
 ```
 
+Transformer training command:
+```bash
+python train.py --config-name=train_diffusion_transformer_hybrid_wds_workspace \
+  task.train_wds_datasets.0.shard_urls='/path/to/train/shard-*.tar' \
+  task.val_wds_datasets.0.shard_urls='/path/to/val/shard-*.tar' \
+  task.dataset.normalizer_cache_path='/path/to/cache/wds_hand_normalizer.pt' \
+  training.steps_per_epoch=1000 \
+  training.device=cuda:0
+```
+
 Multi-GPU training with torchrun:
 ```bash
 torchrun --standalone --nproc_per_node=2 train_torchrun.py \
-  --config-name=train_diffusion_unet_hybrid_wds_workspace \
+  --config-name=train_diffusion_transformer_hybrid_wds_workspace \
   task.train_wds_datasets.0.shard_urls='/path/to/train/shard-*.tar' \
   task.val_wds_datasets.0.shard_urls='/path/to/val/shard-*.tar' \
   task.dataset.normalizer_cache_path='/path/to/cache/wds_hand_normalizer.pt' \
@@ -131,6 +142,8 @@ torchrun --standalone --nproc_per_node=2 train_torchrun.py \
 ```
 
 The WDS workspace detects `WORLD_SIZE`, `RANK`, and `LOCAL_RANK` from torchrun. Rank0 writes wandb logs and checkpoints; all ranks train. Rank0 runs validation and train-sample action MSE while other ranks wait at distributed barriers.
+
+Both WDS workspaces use the Diffusion Policy batch schema `obs.image`, `obs.state`, and `action`. They reuse EgoVLA sliding windows and lowdim transforms, but they do not consume LegendVLA's collated `images`, `states`, `actions`, or `actions_valid_mask` keys.
 
 For a short smoke run:
 ```bash
@@ -157,10 +170,10 @@ Intended checks:
 - Episode tail windows keep fixed tensor shapes under truncate padding.
 - Optional policy smoke test runs `compute_loss()` when `robomimic` and `diffusers` are installed.
 
-Known verification status on 2026-05-05:
+Known verification status on 2026-05-06:
 - Static compile passed:
   ```bash
-  python3 -m py_compile diffusion_policy/dataset/wds_hand_image_dataset.py diffusion_policy/workspace/train_diffusion_unet_hybrid_wds_workspace.py tests/test_wds_hand_image_dataset.py tests/generate_wds_hand_normalizer.py
+  python3 -m py_compile diffusion_policy/dataset/wds_hand_image_dataset.py diffusion_policy/workspace/train_diffusion_unet_hybrid_wds_workspace.py diffusion_policy/workspace/train_diffusion_transformer_hybrid_wds_workspace.py tests/test_wds_hand_image_dataset.py tests/generate_wds_hand_normalizer.py
   ```
 - Runtime pytest was not executed in the implementation shell because that bare Python lacked `pytest`, `omegaconf`, `webdataset`, `cv2`, `PIL`, and `robomimic`.
 

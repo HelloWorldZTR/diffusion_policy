@@ -284,3 +284,81 @@ def test_wds_hand_batch_policy_compute_loss_smoke(tmp_path):
     policy.set_normalizer(dataset.get_normalizer())
     loss = policy.compute_loss(batch)
     assert torch.isfinite(loss)
+
+
+def test_wds_transformer_hybrid_config_smoke():
+    pytest.importorskip("hydra")
+    from hydra import compose, initialize_config_dir
+
+    config_dir = os.path.join(ROOT_DIR, "diffusion_policy", "config")
+    with initialize_config_dir(config_dir=config_dir, version_base=None):
+        cfg = compose(config_name="train_diffusion_transformer_hybrid_wds_workspace")
+
+    assert (
+        cfg._target_
+        == "diffusion_policy.workspace.train_diffusion_transformer_hybrid_wds_workspace.TrainDiffusionTransformerHybridWdsWorkspace"
+    )
+    assert (
+        cfg.policy._target_
+        == "diffusion_policy.policy.diffusion_transformer_hybrid_image_policy.DiffusionTransformerHybridImagePolicy"
+    )
+    assert cfg.dataloader.shuffle is False
+    assert cfg.checkpoint.topk.monitor_key == "val_loss"
+    assert cfg.checkpoint.topk.mode == "min"
+    assert int(cfg.training.steps_per_epoch) > 0
+
+
+def test_wds_hand_batch_transformer_policy_compute_loss_smoke(tmp_path):
+    pytest.importorskip("robomimic")
+    pytest.importorskip("diffusers")
+    from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
+
+    from diffusion_policy.policy.diffusion_transformer_hybrid_image_policy import DiffusionTransformerHybridImagePolicy
+
+    shard = tmp_path / "train.tar"
+    _write_shard(shard, n_frames=4, include_instruction=False)
+    dataset = WdsHandImageDataset(
+        shape_meta=_shape_meta(),
+        train_wds_datasets=[{"shard_urls": str(shard)}],
+        val_wds_datasets=[{"shard_urls": str(shard)}],
+        horizon=3,
+        n_obs_steps=2,
+        image_stride=1,
+        state_stride=1,
+        action_stride=1,
+        shuffle_buffer=0,
+        max_normalizer_samples=16,
+    )
+    batch = next(iter(DataLoader(dataset, batch_size=1, num_workers=0)))
+
+    policy = DiffusionTransformerHybridImagePolicy(
+        shape_meta=_shape_meta(),
+        noise_scheduler=DDPMScheduler(
+            num_train_timesteps=2,
+            beta_start=0.0001,
+            beta_end=0.02,
+            beta_schedule="squaredcos_cap_v2",
+            variance_type="fixed_small",
+            clip_sample=True,
+            prediction_type="epsilon",
+        ),
+        horizon=3,
+        n_action_steps=2,
+        n_obs_steps=2,
+        num_inference_steps=2,
+        crop_shape=None,
+        obs_encoder_group_norm=False,
+        eval_fixed_crop=False,
+        n_layer=2,
+        n_cond_layers=0,
+        n_head=2,
+        n_emb=64,
+        p_drop_emb=0.0,
+        p_drop_attn=0.0,
+        causal_attn=True,
+        time_as_cond=True,
+        obs_as_cond=True,
+    )
+    policy.set_normalizer(dataset.get_normalizer())
+    loss = policy.compute_loss(batch)
+    assert torch.isfinite(loss)

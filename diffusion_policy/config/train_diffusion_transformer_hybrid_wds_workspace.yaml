@@ -2,22 +2,24 @@ defaults:
   - _self_
   - task: wds_hand_image
 
-name: train_diffusion_unet_hybrid_wds
-_target_: diffusion_policy.workspace.train_diffusion_unet_hybrid_wds_workspace.TrainDiffusionUnetHybridWdsWorkspace
+name: train_diffusion_transformer_hybrid_wds
+_target_: diffusion_policy.workspace.train_diffusion_transformer_hybrid_wds_workspace.TrainDiffusionTransformerHybridWdsWorkspace
 
 task_name: ${task.name}
 shape_meta: ${task.shape_meta}
-exp_name: "fold_paperbox_unet"
+exp_name: "fold_paper_box_transformer"
 
 horizon: 16
 n_obs_steps: 2
 n_action_steps: 8
 n_latency_steps: 0
 dataset_obs_steps: ${n_obs_steps}
-obs_as_global_cond: True
+past_action_visible: False
+keypoint_visible_rate: 1.0
+obs_as_cond: True
 
 policy:
-  _target_: diffusion_policy.policy.diffusion_unet_hybrid_image_policy.DiffusionUnetHybridImagePolicy
+  _target_: diffusion_policy.policy.diffusion_transformer_hybrid_image_policy.DiffusionTransformerHybridImagePolicy
   shape_meta: ${shape_meta}
 
   noise_scheduler:
@@ -34,15 +36,20 @@ policy:
   n_action_steps: ${eval:'${n_action_steps}+${n_latency_steps}'}
   n_obs_steps: ${n_obs_steps}
   num_inference_steps: 100
-  obs_as_global_cond: ${obs_as_global_cond}
+
   crop_shape: [216, 216]
-  diffusion_step_embed_dim: 128
-  down_dims: [512, 1024, 2048]
-  kernel_size: 5
-  n_groups: 8
-  cond_predict_scale: True
   obs_encoder_group_norm: True
   eval_fixed_crop: True
+
+  n_layer: 8
+  n_cond_layers: 0
+  n_head: 4
+  n_emb: 256
+  p_drop_emb: 0.0
+  p_drop_attn: 0.3
+  causal_attn: True
+  time_as_cond: True
+  obs_as_cond: ${obs_as_cond}
 
 ema:
   _target_: diffusion_policy.model.diffusion.ema_model.EMAModel
@@ -67,11 +74,10 @@ val_dataloader:
   persistent_workers: False
 
 optimizer:
-  _target_: torch.optim.AdamW
-  lr: 1.0e-4
-  betas: [0.95, 0.999]
-  eps: 1.0e-8
-  weight_decay: 1.0e-6
+  transformer_weight_decay: 1.0e-3
+  obs_encoder_weight_decay: 1.0e-6
+  learning_rate: 1.0e-4
+  betas: [0.9, 0.95]
 
 training:
   device: "cuda:0"
@@ -79,7 +85,7 @@ training:
   debug: False
   resume: True
   lr_scheduler: cosine
-  lr_warmup_steps: 500
+  lr_warmup_steps: 1000
   num_epochs: 3050
   steps_per_epoch: 1000
   gradient_accumulate_every: 1

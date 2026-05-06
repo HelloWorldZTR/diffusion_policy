@@ -2,7 +2,12 @@
 Torchrun entrypoint for distributed WDS training.
 
 Example:
-torchrun --standalone --nproc_per_node=2 train_torchrun.py \
+torchrun --standalone --nproc_per_node=8 train_torchrun.py \
+  --config-name=train_diffusion_transformer_hybrid_wds_workspace \
+  task.train_wds_datasets.0.shard_urls='/path/to/train/shard-*.tar' \
+  task.val_wds_datasets.0.shard_urls='/path/to/val/shard-*.tar'
+
+torchrun --standalone --nproc_per_node=8 train_torchrun.py \
   --config-name=train_diffusion_unet_hybrid_wds_workspace \
   task.train_wds_datasets.0.shard_urls='/path/to/train/shard-*.tar' \
   task.val_wds_datasets.0.shard_urls='/path/to/val/shard-*.tar'
@@ -45,4 +50,3 @@ def main(cfg: OmegaConf):
 
 if __name__ == "__main__":
     main()
-
