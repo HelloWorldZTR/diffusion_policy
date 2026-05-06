@@ -29,6 +29,7 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
             num_inference_steps=None,
             obs_as_global_cond=True,
             crop_shape=(76, 76),
+            resize_shape=None,
             diffusion_step_embed_dim=256,
             down_dims=(256,512,1024),
             kernel_size=5,
@@ -162,6 +163,7 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
         self.n_action_steps = n_action_steps
         self.n_obs_steps = n_obs_steps
         self.obs_as_global_cond = obs_as_global_cond
+        self.resize_shape = resize_shape
         self.kwargs = kwargs
 
         if num_inference_steps is None:

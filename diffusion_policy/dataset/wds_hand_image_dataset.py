@@ -455,16 +455,16 @@ class WdsHandImageDataset(torch.utils.data.IterableDataset):
             return iter(())
         shard_urls = _expand_dataset_shards(datasets)
         is_train = self.mode == "train" if finite is None else not finite
+        pipeline = wds.WebDataset(
+            shard_urls,
+            shardshuffle=False,
+            nodesplitter=no_split if is_train else wds.split_by_node,
+            workersplitter=no_split if is_train else wds.shardlists.split_by_worker,
+            resampled=is_train,
+            empty_check=False,
+            select_files=build_select_files(load_image=load_image, load_depth=False, load_breast=load_image),
+        )
         stages = [
-            wds.WebDataset(
-                shard_urls,
-                shardshuffle=False,
-                nodesplitter=no_split if is_train else wds.split_by_node,
-                workersplitter=no_split if is_train else wds.shardlists.split_by_worker,
-                resampled=is_train,
-                empty_check=False,
-                select_files=build_select_files(load_image=load_image, load_depth=False, load_breast=load_image),
-            ),
             wds.map(decode_sample_fields),
             wds.map(_ensure_instruction_meta),
             lambda src: sliding_window_compose(src, self.window_config),
@@ -482,7 +482,9 @@ class WdsHandImageDataset(torch.utils.data.IterableDataset):
             stages.append(wds.map(materialize_sample_media))
         if preprocess_fn is not None:
             stages.append(wds.map(preprocess_fn))
-        return wds.DataPipeline(*stages)
+        for stage in stages:
+            pipeline.append(stage)
+        return pipeline
 
     def _resize_image_sequence(self, images: np.ndarray, key: str) -> np.ndarray:
         target_h, target_w = self.image_hw_by_key[key]
@@ -504,7 +506,7 @@ class WdsHandImageDataset(torch.utils.data.IterableDataset):
         image = sample[key].astype(np.uint8)
         image = _pad_first_axis(image, self.n_obs_steps)
         image = self._resize_image_sequence(image, key)
-        image = np.moveaxis(image, -1, 1).astype(np.float32) / 255.0
+        image = np.moveaxis(image, -1, 1).astype(np.float32) / 255.0 # normalized to [0,1]
         return image.astype(np.float32)
 
     def _sample_to_dp(self, sample: Dict) -> Dict[str, torch.Tensor]:
@@ -516,9 +518,11 @@ class WdsHandImageDataset(torch.utils.data.IterableDataset):
             extrinsic=sample["extrinsic"],
             use_relative_action=self.use_relative_action,
         )
+        # pad to fixed length
         state = _pad_first_axis(state, self.n_obs_steps)
         action = _pad_first_axis(action, self.horizon)
 
+        # normalize and resize observations
         obs = {key: self._prepare_image_obs(sample, key) for key in self.rgb_keys}
         obs["state"] = state.astype(np.float32)
         data = {

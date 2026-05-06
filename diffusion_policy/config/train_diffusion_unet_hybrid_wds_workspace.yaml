@@ -38,7 +38,7 @@ policy:
 
   # same as in Appendix A.4
   resize_shape: [240, 320]
-  crop_shape: [216, 216]
+  crop_shape: [216, 288]
   diffusion_step_embed_dim: 128
   down_dims: [512, 1024, 2048]
   kernel_size: 5
@@ -58,7 +58,7 @@ ema:
 dataloader:
   batch_size: 64
   num_workers: 8
-  shuffle: False
+  shuffle: False # actual shuffle happens in dataset pipeline
   pin_memory: True
   persistent_workers: False
 

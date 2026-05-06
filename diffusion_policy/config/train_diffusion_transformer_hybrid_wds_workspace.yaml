@@ -63,7 +63,7 @@ ema:
 dataloader:
   batch_size: 64
   num_workers: 8
-  shuffle: False
+  shuffle: False # actual shuffle happens in dataset pipeline
   pin_memory: True
   persistent_workers: False
 

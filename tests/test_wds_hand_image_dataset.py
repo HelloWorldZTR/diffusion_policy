@@ -18,6 +18,7 @@ Image = pytest.importorskip("PIL.Image")
 import torch
 from torch.utils.data import DataLoader
 
+from diffusion_policy.common.pytorch_util import move_to_device
 from diffusion_policy.dataset.wds_hand_image_dataset import StreamingArrayStats, WdsHandImageDataset
 
 
@@ -339,7 +340,25 @@ def test_wds_transformer_hybrid_config_smoke():
     assert cfg.checkpoint.topk.mode == "min"
     assert int(cfg.training.steps_per_epoch) > 0
     assert "breast_image" in cfg.task.shape_meta.obs
-    assert list(cfg.policy.crop_shape) == [216, 216]
+    assert list(cfg.task.shape_meta.obs.image.shape) == [3, 240, 320]
+    assert list(cfg.policy.crop_shape) == [216, 288]
+
+
+def test_move_to_device_preserves_non_tensor_lists():
+    batch = {
+        "obs": {
+            "image": torch.zeros(1, 2, 3, 8, 8),
+            "state": torch.zeros(1, 2, 48),
+        },
+        "action": torch.zeros(1, 3, 48),
+        "metadata": ["episode0", "episode1"],
+    }
+
+    moved = move_to_device(batch, torch.device("cpu"))
+    assert moved["obs"]["image"].device.type == "cpu"
+    assert moved["obs"]["state"].device.type == "cpu"
+    assert moved["action"].device.type == "cpu"
+    assert moved["metadata"] == ["episode0", "episode1"]
 
 
 def test_wds_hand_batch_transformer_policy_compute_loss_smoke(tmp_path):

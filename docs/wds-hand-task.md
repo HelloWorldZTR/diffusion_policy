@@ -64,7 +64,7 @@ Training config:
 - `diffusion_policy/config/train_diffusion_transformer_hybrid_wds_workspace.yaml`
 
 Important defaults:
-- image shape: `[3, 224, 224]`
+- image shape: `[3, 240, 320]`
 - `horizon: 16`
 - `n_obs_steps: 2`
 - `image_stride: 30`

@@ -20,11 +20,14 @@ import sys
 import hydra
 from omegaconf import OmegaConf
 
+from diffusion_policy.common.system_util import configure_data_loading_process
 from diffusion_policy.workspace.base_workspace import BaseWorkspace
 
 
 sys.stdout = open(sys.stdout.fileno(), mode="w", buffering=1)
 sys.stderr = open(sys.stderr.fileno(), mode="w", buffering=1)
+
+configure_data_loading_process()
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 

@@ -30,6 +30,7 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
             num_inference_steps=None,
             # image
             crop_shape=(76, 76),
+            resize_shape=None,
             obs_encoder_group_norm=False,
             eval_fixed_crop=False,
             # arch
@@ -174,6 +175,7 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
         self.n_obs_steps = n_obs_steps
         self.obs_as_cond = obs_as_cond
         self.pred_action_steps_only = pred_action_steps_only
+        self.resize_shape = resize_shape
         self.kwargs = kwargs
 
         if num_inference_steps is None:

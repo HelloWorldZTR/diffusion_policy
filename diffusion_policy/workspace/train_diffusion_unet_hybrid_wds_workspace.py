@@ -25,7 +25,8 @@ from torch.utils.data import DataLoader
 
 from diffusion_policy.common.checkpoint_util import TopKCheckpointManager
 from diffusion_policy.common.json_logger import JsonLogger
-from diffusion_policy.common.pytorch_util import dict_apply, optimizer_to
+from diffusion_policy.common.pytorch_util import move_to_device, optimizer_to
+from diffusion_policy.common.system_util import data_loader_worker_init_fn
 from diffusion_policy.model.common.lr_scheduler import get_scheduler
 from diffusion_policy.model.diffusion.ema_model import EMAModel
 from diffusion_policy.policy.diffusion_unet_hybrid_image_policy import DiffusionUnetHybridImagePolicy
@@ -124,8 +125,14 @@ class TrainDiffusionUnetHybridWdsWorkspace(BaseWorkspace):
                 print(f"Resuming from checkpoint {latest_ckpt_path}")
                 self.load_checkpoint(path=latest_ckpt_path)
 
+        def wds_dataloader_kwargs(dataloader_cfg):
+            kwargs = OmegaConf.to_container(dataloader_cfg, resolve=True)
+            if int(kwargs.get("num_workers", 0)) > 0:
+                kwargs.setdefault("worker_init_fn", data_loader_worker_init_fn)
+            return kwargs
+
         dataset = hydra.utils.instantiate(cfg.task.dataset)
-        train_dataloader = DataLoader(dataset, **cfg.dataloader)
+        train_dataloader = DataLoader(dataset, **wds_dataloader_kwargs(cfg.dataloader))
         normalizer_cache_mode = getattr(dataset, "normalizer_cache_mode", "auto")
         if (
             self.distributed
@@ -147,7 +154,7 @@ class TrainDiffusionUnetHybridWdsWorkspace(BaseWorkspace):
             normalizer = dataset.get_normalizer()
 
         val_dataset = dataset.get_validation_dataset()
-        val_dataloader = DataLoader(val_dataset, **cfg.val_dataloader)
+        val_dataloader = DataLoader(val_dataset, **wds_dataloader_kwargs(cfg.val_dataloader))
 
         self.model.set_normalizer(normalizer)
         if cfg.training.use_ema:
@@ -190,7 +197,9 @@ class TrainDiffusionUnetHybridWdsWorkspace(BaseWorkspace):
                 PolicyLossWrapper(self.model),
                 device_ids=[self.local_rank] if device.type == "cuda" else None,
                 output_device=self.local_rank if device.type == "cuda" else None,
-                find_unused_parameters=False,
+                # Robomimic image encoders can carry auxiliary parameters that
+                # do not participate in every policy loss path.
+                find_unused_parameters=True,
             )
 
         train_sampling_batch = None
@@ -237,7 +246,7 @@ class TrainDiffusionUnetHybridWdsWorkspace(BaseWorkspace):
 
                     for batch_idx in iterator:
                         batch, train_iter = self._next_batch(train_iter, train_dataloader)
-                        batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
+                        batch = move_to_device(batch, device)
                         if train_sampling_batch is None:
                             train_sampling_batch = batch
 
@@ -298,7 +307,7 @@ class TrainDiffusionUnetHybridWdsWorkspace(BaseWorkspace):
                                     mininterval=cfg.training.tqdm_interval_sec,
                                 ) as tepoch:
                                     for batch_idx, batch in enumerate(tepoch):
-                                        batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
+                                        batch = move_to_device(batch, device)
                                         val_losses.append(self.model.compute_loss(batch))
                                         if (
                                             cfg.training.max_val_steps is not None
@@ -310,7 +319,7 @@ class TrainDiffusionUnetHybridWdsWorkspace(BaseWorkspace):
 
                         if (self.epoch % cfg.training.sample_every) == 0 and train_sampling_batch is not None:
                             with torch.no_grad():
-                                batch = dict_apply(train_sampling_batch, lambda x: x.to(device, non_blocking=True))
+                                batch = move_to_device(train_sampling_batch, device)
                                 result = policy.predict_action(batch["obs"])
                                 mse = torch.nn.functional.mse_loss(result["action_pred"], batch["action"])
                                 step_log["train_action_mse_error"] = mse.item()

@@ -9,6 +9,10 @@ import sys
 sys.stdout = open(sys.stdout.fileno(), mode='w', buffering=1)
 sys.stderr = open(sys.stderr.fileno(), mode='w', buffering=1)
 
+from diffusion_policy.common.system_util import configure_data_loading_process
+
+configure_data_loading_process()
+
 import hydra
 from omegaconf import OmegaConf
 import pathlib

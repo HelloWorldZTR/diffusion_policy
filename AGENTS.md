@@ -65,9 +65,6 @@ python tests/generate_wds_hand_normalizer.py \
 Single-GPU transformer smoke test. This checks Hydra instantiation, WDS loading, normalizer loading, one short train loop, validation, sampling, and checkpoint writing:
 ```bash
 python train.py --config-name=train_diffusion_transformer_hybrid_wds_workspace \
-  task.train_wds_datasets.0.shard_urls="$TRAIN_SHARDS" \
-  task.val_wds_datasets.0.shard_urls="$VAL_SHARDS" \
-  task.dataset.normalizer_cache_path="$NORMALIZER_CACHE" \
   task.dataset.normalizer_cache_mode=readonly \
   training.device=cuda:0 \
   training.debug=True \
@@ -85,9 +82,6 @@ python train.py --config-name=train_diffusion_transformer_hybrid_wds_workspace \
 Single-GPU full transformer training:
 ```bash
 python train.py --config-name=train_diffusion_transformer_hybrid_wds_workspace \
-  task.train_wds_datasets.0.shard_urls="$TRAIN_SHARDS" \
-  task.val_wds_datasets.0.shard_urls="$VAL_SHARDS" \
-  task.dataset.normalizer_cache_path="$NORMALIZER_CACHE" \
   task.dataset.normalizer_cache_mode=readonly \
   training.steps_per_epoch=1000 \
   training.device=cuda:0
@@ -95,11 +89,8 @@ python train.py --config-name=train_diffusion_transformer_hybrid_wds_workspace \
 
 Multi-GPU transformer training:
 ```bash
-torchrun --standalone --nproc_per_node=2 train_torchrun.py \
+torchrun --standalone --nproc_per_node=8 train_torchrun.py \
   --config-name=train_diffusion_transformer_hybrid_wds_workspace \
-  task.train_wds_datasets.0.shard_urls="$TRAIN_SHARDS" \
-  task.val_wds_datasets.0.shard_urls="$VAL_SHARDS" \
-  task.dataset.normalizer_cache_path="$NORMALIZER_CACHE" \
   task.dataset.normalizer_cache_mode=readonly \
   training.steps_per_epoch=1000
 ```

@@ -57,8 +57,8 @@ def parse_args():
     parser.add_argument("--image-stride", type=int, default=30)
     parser.add_argument("--state-stride", type=int, default=30)
     parser.add_argument("--action-stride", type=int, default=1)
-    parser.add_argument("--image-height", type=int, default=224)
-    parser.add_argument("--image-width", type=int, default=224)
+    parser.add_argument("--image-height", type=int, default=240)
+    parser.add_argument("--image-width", type=int, default=320)
     parser.add_argument("--history-pad-mode", choices=["repeat", "truncate"], default="repeat")
     parser.add_argument("--action-pad-mode", choices=["repeat", "truncate"], default="repeat")
     parser.add_argument(

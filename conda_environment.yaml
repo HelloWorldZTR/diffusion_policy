@@ -43,6 +43,7 @@ dependencies:
   - boto3=1.24.96
   - accelerate=0.13.2
   - datasets=2.6.1
+  - huggingface_hub=0.13.4
   - diffusers=0.11.1
   - av=10.0.0
   - cmake=3.24.3

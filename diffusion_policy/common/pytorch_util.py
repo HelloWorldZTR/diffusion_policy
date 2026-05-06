@@ -15,6 +15,17 @@ def dict_apply(
             result[key] = func(value)
     return result
 
+def move_to_device(value, device):
+    if isinstance(value, torch.Tensor):
+        return value.to(device, non_blocking=True)
+    if isinstance(value, dict):
+        return {key: move_to_device(item, device) for key, item in value.items()}
+    if isinstance(value, list):
+        return [move_to_device(item, device) for item in value]
+    if isinstance(value, tuple):
+        return tuple(move_to_device(item, device) for item in value)
+    return value
+
 def pad_remaining_dims(x, target):
     assert x.shape == target.shape[:len(x.shape)]
     return x.reshape(x.shape + (1,)*(len(target.shape) - len(x.shape)))
