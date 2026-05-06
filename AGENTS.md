@@ -10,6 +10,7 @@ Primary files:
 - `diffusion_policy/config/task/wds_hand_image.yaml`
 - `diffusion_policy/config/train_diffusion_unet_hybrid_wds_workspace.yaml`
 - `tests/test_wds_hand_image_dataset.py`
+- `tests/generate_wds_hand_normalizer.py`
 - `docs/wds-hand-task.md`
 - `train_torchrun.py`
 
@@ -44,9 +45,11 @@ Implementation notes:
 - Only rank0 writes wandb logs and checkpoints. All ranks train; rank0 runs validation and sampling while the other ranks wait at barriers.
 - WDS train dataloaders must keep `shuffle: False`; shard/sample shuffling is handled inside the WDS pipeline.
 - There is no env runner or rollout metric for this task. Checkpoint top-k monitors `val_loss` with `mode: min`.
-- Normalizer fitting scans lowdim-only WDS samples and caches stats at `task.dataset.normalizer_cache_path`.
-- Do not directly reuse an EgoVLA normalizer file as `normalizer_cache_path`. EgoVLA normalizers are keyed as `states/actions` or `motions`; this Diffusion Policy task requires `image/state/action`. Refit from the same WDS shards, or write an explicit converter that maps keys and verifies matching transform settings.
+- Normalizer fitting scans lowdim-only WDS samples with streaming stats and caches a metadata-validated payload at `task.dataset.normalizer_cache_path`.
+- `normalizer_cache_mode` supports `auto`, `refresh`, and `readonly`. Under torchrun, rank0 generates or refreshes cache while other ranks load it after the barrier.
+- The WDS normalizer matches EgoVLA's wrist rot6d ignore policy for `state/action` dimensions `6:18`.
+- Do not directly reuse an EgoVLA normalizer file as `normalizer_cache_path`. EgoVLA normalizers are keyed as `states/actions` or `motions`; this Diffusion Policy task requires `image/state/action`. Refit from the same WDS shards with `tests/generate_wds_hand_normalizer.py`, or write an explicit converter that maps keys and verifies matching transform settings.
 
 Validation status:
-- `python3 -m py_compile diffusion_policy/dataset/wds_hand_image_dataset.py diffusion_policy/workspace/train_diffusion_unet_hybrid_wds_workspace.py tests/test_wds_hand_image_dataset.py` passed on 2026-05-05.
+- `python3 -m py_compile diffusion_policy/dataset/wds_hand_image_dataset.py diffusion_policy/workspace/train_diffusion_unet_hybrid_wds_workspace.py tests/test_wds_hand_image_dataset.py tests/generate_wds_hand_normalizer.py` passed on 2026-05-05.
 - The local bare Python used during implementation lacked `pytest`, `omegaconf`, `webdataset`, `cv2`, `PIL`, and `robomimic`, so pytest and Hydra runtime smoke tests still need to be run inside the project conda environment.

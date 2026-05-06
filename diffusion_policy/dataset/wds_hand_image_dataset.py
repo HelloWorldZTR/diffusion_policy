@@ -1,11 +1,13 @@
+"""adapted version of EgoVLA's WebDataset dataloader and normalizer"""
 from __future__ import annotations
 
 import copy
-import io
+import datetime
 import os
 import pathlib
+import tempfile
 import warnings
-from typing import Dict, Iterable, List, Optional, Sequence, Union
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Union
 
 import numpy as np
 import torch
@@ -13,12 +15,16 @@ import torch.nn.functional as F
 import webdataset as wds
 
 from diffusion_policy.common.normalize_util import (
-    array_to_stats,
     get_image_range_normalizer,
     get_range_normalizer_from_stat,
 )
 from diffusion_policy.common.pytorch_util import dict_apply
 from diffusion_policy.model.common.normalizer import LinearNormalizer
+
+try:
+    from omegaconf import OmegaConf
+except ImportError:  # pragma: no cover - OmegaConf is present in normal Hydra runs.
+    OmegaConf = None
 
 
 ROOT_DIR = pathlib.Path(__file__).resolve().parents[2]
@@ -46,6 +52,109 @@ except ImportError as e:  # pragma: no cover - exercised only in missing optiona
         "WdsHandImageDataset requires external/EgoVLA plus optional dependencies "
         "`webdataset` and `opencv`. Install the WDS environment before using this task."
     ) from e
+
+
+NORMALIZER_CACHE_SCHEMA_VERSION = 1
+WDS_HAND_TRANSFORM_VERSION = "egovla_wds_hand_v1"
+EGOVLA_WRIST_ROT6D_SLICE = slice(6, 18)
+NORMALIZER_METADATA_COMPARE_KEYS = (
+    "schema_version",
+    "shape_meta",
+    "horizon",
+    "n_obs_steps",
+    "image_stride",
+    "state_stride",
+    "action_stride",
+    "history_pad_mode",
+    "action_pad_mode",
+    "use_relative_action",
+    "transform_version",
+    "match_egovla_rot6d",
+    "rot6d_ignore_slice",
+    "normalizer_datasets",
+    "expanded_shard_urls",
+    "expanded_shard_count",
+)
+
+
+class StreamingArrayStats:
+    """Numerically stable enough per-dimension stats without retaining rows."""
+
+    def __init__(self, dim: int):
+        self.dim = int(dim)
+        self.count = 0
+        self.min = np.full((self.dim,), np.inf, dtype=np.float64)
+        self.max = np.full((self.dim,), -np.inf, dtype=np.float64)
+        self.sum = np.zeros((self.dim,), dtype=np.float64)
+        self.sum_sq = np.zeros((self.dim,), dtype=np.float64)
+
+    def update(self, array: np.ndarray, max_new_rows: Optional[int] = None) -> int:
+        array = np.asarray(array, dtype=np.float32).reshape(-1, self.dim)
+        if max_new_rows is not None:
+            array = array[: max(0, int(max_new_rows))]
+        if array.shape[0] == 0:
+            return 0
+        if not np.all(np.isfinite(array)):
+            raise ValueError("Normalizer scan encountered non-finite lowdim values.")
+        self.min = np.minimum(self.min, array.min(axis=0))
+        self.max = np.maximum(self.max, array.max(axis=0))
+        array64 = array.astype(np.float64)
+        self.sum += array64.sum(axis=0)
+        self.sum_sq += np.square(array64).sum(axis=0)
+        self.count += int(array.shape[0])
+        return int(array.shape[0])
+
+    def to_stats(self) -> Dict[str, np.ndarray]:
+        if self.count <= 0:
+            raise RuntimeError("Cannot finalize empty streaming stats.")
+        mean = self.sum / self.count
+        var = np.maximum(self.sum_sq / self.count - np.square(mean), 0.0)
+        return {
+            "min": self.min.astype(np.float32),
+            "max": self.max.astype(np.float32),
+            "mean": mean.astype(np.float32),
+            "std": np.sqrt(var).astype(np.float32),
+        }
+
+
+def _normalizer_with_ignored_dim(stat: Dict[str, np.ndarray], ignore_dim: Optional[slice] = None):
+    normalizer = get_range_normalizer_from_stat(stat)
+    if ignore_dim is None:
+        return normalizer
+    params = normalizer.params_dict
+    params["scale"][ignore_dim] = 1.0
+    params["offset"][ignore_dim] = 0.0
+    ignored_dim_mask = torch.zeros_like(params["scale"])
+    ignored_dim_mask[ignore_dim] = 1.0
+    params["ignored_dim_mask"] = torch.nn.Parameter(ignored_dim_mask, requires_grad=False)
+    return normalizer
+
+
+def _jsonable(value: Any) -> Any:
+    if OmegaConf is not None and OmegaConf.is_config(value):
+        return _jsonable(OmegaConf.to_container(value, resolve=True))
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, pathlib.Path):
+        return str(value)
+    if isinstance(value, dict) or hasattr(value, "items"):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(v) for v in value]
+    return value
+
+
+def _stats_to_payload(stats: Dict[str, Dict[str, np.ndarray]]) -> Dict[str, Dict[str, List[float]]]:
+    return {
+        key: {stat_name: stat_value.astype(np.float32).tolist() for stat_name, stat_value in value.items()}
+        for key, value in stats.items()
+    }
+
+
+def _torch_load_cpu(path: str):
+    return torch.load(path, map_location="cpu")
 
 
 def _rot_matrix_from_6drot(rot: np.ndarray) -> np.ndarray:
@@ -249,10 +358,18 @@ class WdsHandImageDataset(torch.utils.data.IterableDataset):
         normalizer_cache_path: Optional[str] = None,
         normalizer_wds_datasets: Optional[DatasetSpec] = None,
         max_normalizer_samples: int = 100000,
+        normalizer_max_rows: Optional[int] = None,
+        normalizer_cache_mode: str = "auto",
+        normalizer_match_egovla_rot6d: bool = True,
     ):
         super().__init__()
         if mode not in {"train", "val"}:
             raise ValueError(f"mode must be train or val, got {mode!r}")
+        if normalizer_cache_mode not in {"auto", "refresh", "readonly"}:
+            raise ValueError(
+                "normalizer_cache_mode must be one of auto, refresh, readonly; "
+                f"got {normalizer_cache_mode!r}"
+            )
         self.shape_meta = shape_meta
         self.train_wds_datasets = _as_dataset_list(train_wds_datasets)
         self.val_wds_datasets = _as_dataset_list(val_wds_datasets) if val_wds_datasets is not None else None
@@ -274,7 +391,14 @@ class WdsHandImageDataset(torch.utils.data.IterableDataset):
             if normalizer_wds_datasets is not None
             else self.train_wds_datasets
         )
-        self.max_normalizer_samples = int(max_normalizer_samples)
+        if normalizer_max_rows is None:
+            normalizer_max_rows = max_normalizer_samples
+        self.max_normalizer_samples = int(normalizer_max_rows)
+        self.normalizer_max_rows = int(normalizer_max_rows)
+        if self.normalizer_max_rows <= 0:
+            raise ValueError("normalizer_max_rows must be a positive integer.")
+        self.normalizer_cache_mode = normalizer_cache_mode
+        self.normalizer_match_egovla_rot6d = bool(normalizer_match_egovla_rot6d)
 
         image_shape = tuple(shape_meta["obs"]["image"]["shape"])
         if len(image_shape) != 3 or image_shape[0] != 3:
@@ -390,7 +514,7 @@ class WdsHandImageDataset(torch.utils.data.IterableDataset):
             _, action = self._lowdim_sample_to_arrays(sample)
             actions.append(action)
             count += action.shape[0]
-            if count >= self.max_normalizer_samples:
+            if count >= self.normalizer_max_rows:
                 break
         if not actions:
             return torch.empty((0, 48), dtype=torch.float32)
@@ -412,40 +536,169 @@ class WdsHandImageDataset(torch.utils.data.IterableDataset):
         scan_set.val_wds_datasets = self.normalizer_wds_datasets
         return scan_set._build_pipeline(load_image=False, finite=True)
 
-    def get_normalizer(self, **kwargs) -> LinearNormalizer:
+    def _normalizer_cache_path(self) -> Optional[str]:
+        if self.normalizer_cache_path is None:
+            return None
+        return os.path.expanduser(self.normalizer_cache_path)
+
+    def _expanded_normalizer_shards(self) -> List[str]:
+        return _expand_dataset_shards(self.normalizer_wds_datasets)
+
+    def _normalizer_expected_metadata(self, expanded_shards: Optional[List[str]] = None) -> Dict[str, Any]:
+        if expanded_shards is None:
+            expanded_shards = self._expanded_normalizer_shards()
+        return {
+            "schema_version": NORMALIZER_CACHE_SCHEMA_VERSION,
+            "shape_meta": _jsonable(self.shape_meta),
+            "horizon": self.horizon,
+            "n_obs_steps": self.n_obs_steps,
+            "image_stride": self.image_stride,
+            "state_stride": self.state_stride,
+            "action_stride": self.action_stride,
+            "history_pad_mode": self.history_pad_mode,
+            "action_pad_mode": self.action_pad_mode,
+            "use_relative_action": self.use_relative_action,
+            "transform_version": WDS_HAND_TRANSFORM_VERSION,
+            "match_egovla_rot6d": self.normalizer_match_egovla_rot6d,
+            "rot6d_ignore_slice": [EGOVLA_WRIST_ROT6D_SLICE.start, EGOVLA_WRIST_ROT6D_SLICE.stop],
+            "normalizer_datasets": _jsonable(self.normalizer_wds_datasets),
+            "expanded_shard_urls": [os.fspath(x) for x in expanded_shards],
+            "expanded_shard_count": len(expanded_shards),
+            "normalizer_max_rows": self.normalizer_max_rows,
+        }
+
+    def _metadata_mismatch_reason(self, actual: Dict[str, Any], expected: Dict[str, Any]) -> Optional[str]:
+        for key in NORMALIZER_METADATA_COMPARE_KEYS:
+            if actual.get(key) != expected.get(key):
+                return f"{key}: cache={actual.get(key)!r} current={expected.get(key)!r}"
+        return None
+
+    def _load_normalizer_cache(
+        self,
+        cache_path: str,
+        expected_metadata: Dict[str, Any],
+    ) -> Optional[LinearNormalizer]:
+        if not os.path.exists(cache_path):
+            if self.normalizer_cache_mode == "readonly":
+                raise FileNotFoundError(f"Normalizer cache does not exist: {cache_path}")
+            return None
+
         normalizer = LinearNormalizer()
-        if self.normalizer_cache_path and os.path.exists(self.normalizer_cache_path):
-            normalizer.load_state_dict(torch.load(self.normalizer_cache_path, map_location="cpu"))
+        payload = _torch_load_cpu(cache_path)
+        if isinstance(payload, dict) and "normalizer_state_dict" in payload:
+            if payload.get("schema_version") != NORMALIZER_CACHE_SCHEMA_VERSION:
+                reason = (
+                    f"schema_version: cache={payload.get('schema_version')!r} "
+                    f"current={NORMALIZER_CACHE_SCHEMA_VERSION!r}"
+                )
+                if self.normalizer_cache_mode == "readonly":
+                    raise RuntimeError(f"Normalizer cache metadata mismatch ({reason}).")
+                warnings.warn(f"Regenerating WDS normalizer cache because metadata mismatched ({reason}).")
+                return None
+            actual_metadata = payload.get("metadata", {})
+            reason = self._metadata_mismatch_reason(actual_metadata, expected_metadata)
+            if reason is not None:
+                if self.normalizer_cache_mode == "readonly":
+                    raise RuntimeError(f"Normalizer cache metadata mismatch ({reason}).")
+                warnings.warn(f"Regenerating WDS normalizer cache because metadata mismatched ({reason}).")
+                return None
+            normalizer.load_state_dict(payload["normalizer_state_dict"])
             return normalizer
 
-        states = []
-        actions = []
-        count = 0
+        # Backward compatibility for the first WDS adapter cache format, which
+        # saved only LinearNormalizer.state_dict() and has no metadata.
+        normalizer.load_state_dict(payload)
+        warnings.warn(
+            "Loaded legacy WDS normalizer cache without metadata validation. "
+            "Run with normalizer_cache_mode=refresh to rewrite it in the new format."
+        )
+        return normalizer
+
+    def _save_normalizer_cache(
+        self,
+        cache_path: str,
+        normalizer: LinearNormalizer,
+        stats: Dict[str, Dict[str, np.ndarray]],
+        metadata: Dict[str, Any],
+    ) -> None:
+        cache_dir = os.path.dirname(cache_path)
+        if cache_dir:
+            os.makedirs(cache_dir, exist_ok=True)
+        payload = {
+            "schema_version": NORMALIZER_CACHE_SCHEMA_VERSION,
+            "normalizer_state_dict": normalizer.state_dict(),
+            "stats": _stats_to_payload(stats),
+            "metadata": _jsonable(metadata),
+        }
+        tmp_path = None
+        try:
+            fd, tmp_path = tempfile.mkstemp(
+                prefix=".tmp-wds-hand-normalizer-",
+                suffix=".pt",
+                dir=cache_dir or ".",
+            )
+            with os.fdopen(fd, "wb") as f:
+                torch.save(payload, f)
+            os.replace(tmp_path, cache_path)
+        finally:
+            if tmp_path is not None and os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+    def _fit_normalizer_from_wds(
+        self,
+        expected_metadata: Dict[str, Any],
+    ) -> tuple[LinearNormalizer, Dict[str, Dict[str, np.ndarray]], Dict[str, Any]]:
+        state_stats = StreamingArrayStats(48)
+        action_stats = StreamingArrayStats(48)
+        window_count = 0
         for sample in self._iter_lowdim_samples():
             state, action = self._lowdim_sample_to_arrays(sample)
-            states.append(state)
-            actions.append(action)
-            count += state.shape[0] + action.shape[0]
-            if count >= self.max_normalizer_samples:
+            state_stats.update(state, max_new_rows=self.normalizer_max_rows - state_stats.count)
+            action_stats.update(action, max_new_rows=self.normalizer_max_rows - action_stats.count)
+            window_count += 1
+            if state_stats.count >= self.normalizer_max_rows and action_stats.count >= self.normalizer_max_rows:
                 break
-        if not states or not actions:
+        if state_stats.count == 0 or action_stats.count == 0:
             raise RuntimeError("No WDS samples available for normalizer fitting.")
 
-        state_arr = np.concatenate(states, axis=0).astype(np.float32)
-        action_arr = np.concatenate(actions, axis=0).astype(np.float32)
+        stats = {
+            "state": state_stats.to_stats(),
+            "action": action_stats.to_stats(),
+        }
+        normalizer = LinearNormalizer()
         normalizer["image"] = get_image_range_normalizer()
-        normalizer["state"] = get_range_normalizer_from_stat(array_to_stats(state_arr))
-        normalizer["action"] = get_range_normalizer_from_stat(array_to_stats(action_arr))
+        ignore_dim = EGOVLA_WRIST_ROT6D_SLICE if self.normalizer_match_egovla_rot6d else None
+        normalizer["state"] = _normalizer_with_ignored_dim(stats["state"], ignore_dim=ignore_dim)
+        normalizer["action"] = _normalizer_with_ignored_dim(stats["action"], ignore_dim=ignore_dim)
+        metadata = dict(expected_metadata)
+        metadata.update(
+            {
+                "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "windows_scanned": window_count,
+                "effective_rows": {
+                    "state": state_stats.count,
+                    "action": action_stats.count,
+                },
+                "normalizer_keys": ["image", "state", "action"],
+            }
+        )
+        return normalizer, stats, metadata
 
-        if self.normalizer_cache_path:
-            cache_path = os.path.expanduser(self.normalizer_cache_path)
-            cache_dir = os.path.dirname(cache_path)
-            if cache_dir:
-                os.makedirs(cache_dir, exist_ok=True)
-            buffer = io.BytesIO()
-            torch.save(normalizer.state_dict(), buffer)
-            with open(cache_path, "wb") as f:
-                f.write(buffer.getvalue())
+    def get_normalizer(self, **kwargs) -> LinearNormalizer:
+        cache_path = self._normalizer_cache_path()
+        if cache_path is None and self.normalizer_cache_mode == "readonly":
+            raise ValueError("normalizer_cache_mode=readonly requires normalizer_cache_path.")
+
+        expanded_shards = self._expanded_normalizer_shards()
+        expected_metadata = self._normalizer_expected_metadata(expanded_shards)
+        if self.normalizer_cache_mode != "refresh" and cache_path is not None:
+            cached = self._load_normalizer_cache(cache_path, expected_metadata)
+            if cached is not None:
+                return cached
+
+        normalizer, stats, metadata = self._fit_normalizer_from_wds(expected_metadata)
+        if cache_path is not None:
+            self._save_normalizer_cache(cache_path, normalizer, stats, metadata)
         return normalizer
 
 

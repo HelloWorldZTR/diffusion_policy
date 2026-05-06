@@ -69,9 +69,42 @@ Important defaults:
 - train shards: `data/wds/train/shard-*.tar`
 - validation shards: `data/wds/val/shard-*.tar`
 - normalizer cache: `data/wds/cache/wds_hand_normalizer.pt`
+- normalizer cache mode: `auto`
+- normalizer max rows per key: `100000`
+- EgoVLA wrist rot6d ignore policy: enabled
 - checkpoint monitor: `val_loss`, `mode: min`
 
 `training.steps_per_epoch` is required because the training dataset is streaming and has no meaningful length.
+
+## Normalizer Compatibility
+
+The current Diffusion Policy WDS task does not directly load an EgoVLA normalizer file as-is.
+
+Why:
+- EgoVLA normalizer fitting is built around low-level keys named `states` / `actions` when `use_relative_action=True`, or `motions` when `use_relative_action=False`.
+- This Diffusion Policy adapter must provide normalizer keys matching the policy batch contract: `image`, `state`, and `action`.
+- The DP policy calls `normalizer.normalize(batch["obs"])`, so `obs.state` needs a `state` entry and `obs.image` needs an `image` entry.
+- EgoVLA's normalizer utility applies an `ignore_dim` policy to wrist rot6d dimensions. The DP WDS adapter matches that behavior for `state` and `action` dimensions `6:18`.
+
+What can be reused:
+- Reuse the same WDS shards and the same EgoVLA-style state/action transform. This is what `WdsHandImageDataset.get_normalizer()` already does.
+- Reuse the idea of separate `states` and `actions` statistics, but regenerate them into DP's key names and cache format.
+- If an existing EgoVLA normalizer must be reused, add a small conversion step that maps `states -> state`, `actions -> action`, adds `image -> get_image_range_normalizer()`, and verifies that the source normalizer was fitted with the same `use_relative_action`, horizons, strides, hand dimensions, and transform code. Do not point `task.dataset.normalizer_cache_path` at an EgoVLA checkpoint without this conversion.
+
+Recommended default:
+- Let this repo fit and cache its own normalizer at `task.dataset.normalizer_cache_path`.
+- Keep `task.dataset.normalizer_cache_mode=auto`; the adapter validates cache metadata and regenerates when key settings or shard lists change.
+- Use `task.dataset.normalizer_cache_mode=refresh` to force a rewrite, or `readonly` to require an existing matching cache.
+
+Generate or refresh the cache explicitly:
+```bash
+python tests/generate_wds_hand_normalizer.py \
+  --cache-mode refresh \
+  --cache-path /path/to/cache/wds_hand_normalizer.pt \
+  task.train_wds_datasets.0.shard_urls='/path/to/train/shard-*.tar'
+```
+
+The saved `.pt` cache contains `normalizer_state_dict`, raw lowdim `stats`, validation `metadata`, and a `schema_version`. The first WDS adapter cache format, which saved only a bare `LinearNormalizer.state_dict()`, is still loadable but cannot be metadata-validated.
 
 ## Running
 
@@ -86,6 +119,18 @@ python train.py --config-name=train_diffusion_unet_hybrid_wds_workspace \
   training.steps_per_epoch=1000 \
   training.device=cuda:0
 ```
+
+Multi-GPU training with torchrun:
+```bash
+torchrun --standalone --nproc_per_node=2 train_torchrun.py \
+  --config-name=train_diffusion_unet_hybrid_wds_workspace \
+  task.train_wds_datasets.0.shard_urls='/path/to/train/shard-*.tar' \
+  task.val_wds_datasets.0.shard_urls='/path/to/val/shard-*.tar' \
+  task.dataset.normalizer_cache_path='/path/to/cache/wds_hand_normalizer.pt' \
+  training.steps_per_epoch=1000
+```
+
+The WDS workspace detects `WORLD_SIZE`, `RANK`, and `LOCAL_RANK` from torchrun. Rank0 writes wandb logs and checkpoints; all ranks train. Rank0 runs validation and train-sample action MSE while other ranks wait at distributed barriers.
 
 For a short smoke run:
 ```bash
@@ -115,7 +160,7 @@ Intended checks:
 Known verification status on 2026-05-05:
 - Static compile passed:
   ```bash
-  python3 -m py_compile diffusion_policy/dataset/wds_hand_image_dataset.py diffusion_policy/workspace/train_diffusion_unet_hybrid_wds_workspace.py tests/test_wds_hand_image_dataset.py
+  python3 -m py_compile diffusion_policy/dataset/wds_hand_image_dataset.py diffusion_policy/workspace/train_diffusion_unet_hybrid_wds_workspace.py tests/test_wds_hand_image_dataset.py tests/generate_wds_hand_normalizer.py
   ```
 - Runtime pytest was not executed in the implementation shell because that bare Python lacked `pytest`, `omegaconf`, `webdataset`, `cv2`, `PIL`, and `robomimic`.
 
@@ -130,4 +175,4 @@ python -m pytest -q tests/test_wds_hand_image_dataset.py
 - Top-k checkpoints depend on validation producing `val_loss`; keep `val_wds_datasets` configured.
 - The adapter assumes head-camera WDS data compatible with EgoVLA `wds_dataset.py`.
 - The root `external/EgoVLA` checkout is required because the adapter reuses its WDS sliding-window utilities.
-
+- DDP support is currently implemented for the WDS hybrid workspace path, not for every legacy workspace in the repo.

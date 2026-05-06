@@ -18,7 +18,7 @@ Image = pytest.importorskip("PIL.Image")
 import torch
 from torch.utils.data import DataLoader
 
-from diffusion_policy.dataset.wds_hand_image_dataset import WdsHandImageDataset
+from diffusion_policy.dataset.wds_hand_image_dataset import StreamingArrayStats, WdsHandImageDataset
 
 
 def _encode_npy(array):
@@ -124,6 +124,87 @@ def test_wds_hand_dataset_shapes_and_missing_instruction(tmp_path):
 
     normalizer = dataset.get_normalizer()
     assert set(normalizer.params_dict.keys()) == {"image", "state", "action"}
+    assert torch.allclose(normalizer["state"].params_dict["scale"][6:18], torch.ones(12))
+    assert torch.allclose(normalizer["state"].params_dict["offset"][6:18], torch.zeros(12))
+    assert torch.allclose(normalizer["action"].params_dict["scale"][6:18], torch.ones(12))
+    assert torch.allclose(normalizer["action"].params_dict["offset"][6:18], torch.zeros(12))
+
+
+def test_streaming_array_stats_matches_numpy():
+    array = np.arange(30, dtype=np.float32).reshape(10, 3)
+    stats = StreamingArrayStats(3)
+    stats.update(array[:4])
+    stats.update(array[4:])
+    result = stats.to_stats()
+
+    assert stats.count == 10
+    np.testing.assert_allclose(result["min"], array.min(axis=0))
+    np.testing.assert_allclose(result["max"], array.max(axis=0))
+    np.testing.assert_allclose(result["mean"], array.mean(axis=0))
+    np.testing.assert_allclose(result["std"], array.std(axis=0), rtol=1e-6)
+
+
+def test_wds_hand_normalizer_cache_payload_modes_and_legacy_load(tmp_path):
+    shard = tmp_path / "train.tar"
+    cache = tmp_path / "normalizer.pt"
+    _write_shard(shard, n_frames=4, include_instruction=False)
+    dataset = WdsHandImageDataset(
+        shape_meta=_shape_meta(),
+        train_wds_datasets=[{"shard_urls": str(shard)}],
+        val_wds_datasets=[{"shard_urls": str(shard)}],
+        horizon=3,
+        n_obs_steps=2,
+        image_stride=1,
+        state_stride=1,
+        action_stride=1,
+        shuffle_buffer=0,
+        normalizer_cache_path=str(cache),
+        normalizer_cache_mode="auto",
+        normalizer_max_rows=16,
+    )
+
+    normalizer = dataset.get_normalizer()
+    payload = torch.load(cache, map_location="cpu")
+    assert set(payload.keys()) == {"schema_version", "normalizer_state_dict", "stats", "metadata"}
+    assert payload["metadata"]["normalizer_keys"] == ["image", "state", "action"]
+    assert payload["metadata"]["effective_rows"]["state"] > 0
+    assert payload["metadata"]["effective_rows"]["action"] > 0
+
+    reloaded = dataset.get_normalizer()
+    assert set(reloaded.params_dict.keys()) == {"image", "state", "action"}
+
+    stale_payload = torch.load(cache, map_location="cpu")
+    stale_payload["metadata"]["use_relative_action"] = False
+    torch.save(stale_payload, cache)
+    regenerated = dataset.get_normalizer()
+    assert set(regenerated.params_dict.keys()) == {"image", "state", "action"}
+    assert torch.load(cache, map_location="cpu")["metadata"]["use_relative_action"] is True
+
+    stale_payload = torch.load(cache, map_location="cpu")
+    stale_payload["metadata"]["use_relative_action"] = False
+    torch.save(stale_payload, cache)
+    dataset.normalizer_cache_mode = "readonly"
+    with pytest.raises(RuntimeError, match="metadata mismatch"):
+        dataset.get_normalizer()
+
+    legacy_cache = tmp_path / "legacy.pt"
+    torch.save(normalizer.state_dict(), legacy_cache)
+    legacy_dataset = WdsHandImageDataset(
+        shape_meta=_shape_meta(),
+        train_wds_datasets=[{"shard_urls": str(shard)}],
+        val_wds_datasets=[{"shard_urls": str(shard)}],
+        horizon=3,
+        n_obs_steps=2,
+        image_stride=1,
+        state_stride=1,
+        action_stride=1,
+        shuffle_buffer=0,
+        normalizer_cache_path=str(legacy_cache),
+        normalizer_cache_mode="readonly",
+    )
+    with pytest.warns(UserWarning, match="legacy WDS normalizer cache"):
+        legacy = legacy_dataset.get_normalizer()
+    assert set(legacy.params_dict.keys()) == {"image", "state", "action"}
 
 
 def test_wds_hand_dataset_fixed_shapes_at_episode_tail_with_truncate(tmp_path):

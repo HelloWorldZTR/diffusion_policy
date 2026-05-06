@@ -126,13 +126,23 @@ class TrainDiffusionUnetHybridWdsWorkspace(BaseWorkspace):
 
         dataset = hydra.utils.instantiate(cfg.task.dataset)
         train_dataloader = DataLoader(dataset, **cfg.dataloader)
-        if self.distributed and getattr(dataset, "normalizer_cache_path", None):
+        normalizer_cache_mode = getattr(dataset, "normalizer_cache_mode", "auto")
+        if (
+            self.distributed
+            and getattr(dataset, "normalizer_cache_path", None)
+            and normalizer_cache_mode != "readonly"
+        ):
             if self.is_rank0:
                 normalizer = dataset.get_normalizer()
                 self._barrier()
             else:
                 self._barrier()
-                normalizer = dataset.get_normalizer()
+                old_cache_mode = dataset.normalizer_cache_mode
+                dataset.normalizer_cache_mode = "readonly"
+                try:
+                    normalizer = dataset.get_normalizer()
+                finally:
+                    dataset.normalizer_cache_mode = old_cache_mode
         else:
             normalizer = dataset.get_normalizer()
 

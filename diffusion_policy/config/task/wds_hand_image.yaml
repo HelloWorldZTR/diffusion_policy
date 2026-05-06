@@ -38,5 +38,7 @@ dataset:
   keep_ratio: 1.0
   use_relative_action: True
   normalizer_cache_path: data/wds/cache/wds_hand_normalizer.pt
+  normalizer_cache_mode: auto
   normalizer_wds_datasets: *train_wds_datasets
-  max_normalizer_samples: 100000
+  normalizer_max_rows: 100000
+  normalizer_match_egovla_rot6d: True
