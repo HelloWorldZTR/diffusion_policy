@@ -13,6 +13,7 @@ Primary files:
 - `diffusion_policy/config/train_diffusion_transformer_hybrid_wds_workspace.yaml`
 - `tests/test_wds_hand_image_dataset.py`
 - `tests/generate_wds_hand_normalizer.py`
+- `tests/export_wds_hand_window.py`
 - `docs/wds-hand-task.md`
 - `train_torchrun.py`
 
@@ -24,29 +25,105 @@ Key behavior:
 - The WDS lowdim layout is expected to match EgoVLA: `wrist_state[18]`, `hand_state[30]`, `wrist_action[18]`, `hand_action[30]`, then camera calibration blocks.
 - The target representation follows the EgoVLA fingertips transform: wrist pose is transformed to the head-camera frame, fingertips are transformed to each wrist frame, and actions default to relative actions from the latest observed state.
 
-Training entrypoint:
+## Training Command Runbook
+
+Use the project conda environment for runtime checks and training:
 ```bash
-python train.py --config-name=train_diffusion_unet_hybrid_wds_workspace \
-  task.train_wds_datasets.0.shard_urls='/path/to/train/shard-*.tar' \
-  task.val_wds_datasets.0.shard_urls='/path/to/val/shard-*.tar' \
-  training.device=cuda:0
+conda activate robodiff
 ```
 
-Transformer training entrypoint:
+Set the shard and cache paths once, then reuse them in the commands below:
+```bash
+export TRAIN_SHARDS='/path/to/train/shard-*.tar'
+export VAL_SHARDS='/path/to/val/shard-*.tar'
+export NORMALIZER_CACHE='data/wds/cache/wds_hand_normalizer.pt'
+```
+or config them in `config/task/wds_hand_image.yaml`
+
+Dataset unit checks:
+```bash
+python -m pytest -q tests/test_wds_hand_image_dataset.py
+```
+
+Real-shard data inspection. This exports one decoded WDS window, image contact sheet, tensor summary, and optional `.npz` payload under `outputs/wds_hand_windows/`:
+```bash
+python tests/export_wds_hand_window.py \
+  --shards "$VAL_SHARDS" \
+  --window-index 0
+```
+
+Generate or refresh the normalizer cache from the training shards:
+```bash
+python tests/generate_wds_hand_normalizer.py \
+  --config-name=train_diffusion_transformer_hybrid_wds_workspace \
+  --cache-mode refresh \
+  --cache-path "$NORMALIZER_CACHE" \
+  task.train_wds_datasets.0.shard_urls="$TRAIN_SHARDS" \
+  task.val_wds_datasets.0.shard_urls="$VAL_SHARDS"
+```
+
+Single-GPU transformer smoke test. This checks Hydra instantiation, WDS loading, normalizer loading, one short train loop, validation, sampling, and checkpoint writing:
 ```bash
 python train.py --config-name=train_diffusion_transformer_hybrid_wds_workspace \
-  task.train_wds_datasets.0.shard_urls='/path/to/train/shard-*.tar' \
-  task.val_wds_datasets.0.shard_urls='/path/to/val/shard-*.tar' \
+  task.train_wds_datasets.0.shard_urls="$TRAIN_SHARDS" \
+  task.val_wds_datasets.0.shard_urls="$VAL_SHARDS" \
+  task.dataset.normalizer_cache_path="$NORMALIZER_CACHE" \
+  task.dataset.normalizer_cache_mode=readonly \
+  training.device=cuda:0 \
+  training.debug=True \
+  training.num_epochs=1 \
+  training.steps_per_epoch=2 \
+  training.max_val_steps=2 \
+  training.resume=False \
+  logging.mode=offline \
+  dataloader.batch_size=2 \
+  val_dataloader.batch_size=2 \
+  dataloader.num_workers=0 \
+  val_dataloader.num_workers=0
+```
+
+Single-GPU full transformer training:
+```bash
+python train.py --config-name=train_diffusion_transformer_hybrid_wds_workspace \
+  task.train_wds_datasets.0.shard_urls="$TRAIN_SHARDS" \
+  task.val_wds_datasets.0.shard_urls="$VAL_SHARDS" \
+  task.dataset.normalizer_cache_path="$NORMALIZER_CACHE" \
+  task.dataset.normalizer_cache_mode=readonly \
   training.steps_per_epoch=1000 \
   training.device=cuda:0
 ```
 
-Multi-GPU torchrun entrypoint:
+Multi-GPU transformer training:
 ```bash
 torchrun --standalone --nproc_per_node=2 train_torchrun.py \
   --config-name=train_diffusion_transformer_hybrid_wds_workspace \
-  task.train_wds_datasets.0.shard_urls='/path/to/train/shard-*.tar' \
-  task.val_wds_datasets.0.shard_urls='/path/to/val/shard-*.tar'
+  task.train_wds_datasets.0.shard_urls="$TRAIN_SHARDS" \
+  task.val_wds_datasets.0.shard_urls="$VAL_SHARDS" \
+  task.dataset.normalizer_cache_path="$NORMALIZER_CACHE" \
+  task.dataset.normalizer_cache_mode=readonly \
+  training.steps_per_epoch=1000
+```
+
+UNet training entrypoint:
+```bash
+python train.py --config-name=train_diffusion_unet_hybrid_wds_workspace \
+  task.train_wds_datasets.0.shard_urls="$TRAIN_SHARDS" \
+  task.val_wds_datasets.0.shard_urls="$VAL_SHARDS" \
+  task.dataset.normalizer_cache_path="$NORMALIZER_CACHE" \
+  task.dataset.normalizer_cache_mode=readonly \
+  training.steps_per_epoch=1000 \
+  training.device=cuda:0
+```
+
+UNet multi-GPU torchrun entrypoint:
+```bash
+torchrun --standalone --nproc_per_node=2 train_torchrun.py \
+  --config-name=train_diffusion_unet_hybrid_wds_workspace \
+  task.train_wds_datasets.0.shard_urls="$TRAIN_SHARDS" \
+  task.val_wds_datasets.0.shard_urls="$VAL_SHARDS" \
+  task.dataset.normalizer_cache_path="$NORMALIZER_CACHE" \
+  task.dataset.normalizer_cache_mode=readonly \
+  training.steps_per_epoch=1000
 ```
 
 Implementation notes:
