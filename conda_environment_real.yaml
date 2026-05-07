@@ -61,6 +61,8 @@ dependencies:
     - robomimic==0.2.0
     - pytorchvideo==0.1.5
     - webdataset
+    - msgpack
+    - websockets
     # requires librealsense https://github.com/IntelRealSense/librealsense/blob/master/doc/distribution_linux.md
     - pyrealsense2==2.51.1.4348
     # requires apt install libspnav-dev spacenavd; systemctl start spacenavd

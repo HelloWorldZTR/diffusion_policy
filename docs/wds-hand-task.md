@@ -148,6 +148,33 @@ The WDS workspace detects `WORLD_SIZE`, `RANK`, and `LOCAL_RANK` from torchrun. 
 
 Both WDS workspaces use the Diffusion Policy batch schema `obs.image`, `obs.breast_image`, `obs.state`, and `action`. They reuse EgoVLA sliding windows and lowdim transforms, but they do not consume LegendVLA's collated `images`, `states`, `actions`, or `actions_valid_mask` keys.
 
+## LegendVLA-Compatible Serving
+
+The WDS checkpoints can be served over the same msgpack WebSocket protocol used by LegendVLA/EgoVLA:
+```bash
+python -m diffusion_policy.serving.legendvla_policy_server \
+  -i /path/to/checkpoint.ckpt \
+  --host 0.0.0.0 \
+  --port 8765 \
+  --device cuda:0
+```
+
+This serving entrypoint additionally requires `websockets` and `msgpack` in the runtime environment.
+
+Probe a running server with a fake LegendVLA-Inference-style dual-camera client:
+```bash
+python -m diffusion_policy.serving.fake_legendvla_client \
+  --host 127.0.0.1 \
+  --port 8765 \
+  --num-requests 3
+```
+
+The request payload must provide LegendVLA-style keys:
+- `image`: a camera dictionary with `head` and `chest` RGB histories
+- `states`: already-processed 48D state history matching the WDS representation
+
+The server maps `image.head` to `obs.image`, `image.chest` to `obs.breast_image`, and `states` to `obs.state`. Histories are repeat-left padded or truncated to `n_obs_steps`, RGB frames are resized to the checkpoint image shape, and the response uses `{"pred_actions": ...}` in the Diffusion Policy model action space. If the checkpoint was trained with `use_relative_action=True`, the returned 48D actions remain relative actions.
+
 For a short smoke run:
 ```bash
 python train.py --config-name=train_diffusion_unet_hybrid_wds_workspace \
