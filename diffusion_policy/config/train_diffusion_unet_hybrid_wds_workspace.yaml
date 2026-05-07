@@ -56,17 +56,17 @@ ema:
   max_value: 0.9999
 
 dataloader:
-  batch_size: 64
-  num_workers: 8
+  batch_size: 16
+  num_workers: 4
   shuffle: False # actual shuffle happens in dataset pipeline
-  pin_memory: True
+  pin_memory: False
   persistent_workers: False
 
 val_dataloader:
-  batch_size: 64
-  num_workers: 8
+  batch_size: 16
+  num_workers: 4
   shuffle: False
-  pin_memory: True
+  pin_memory: False
   persistent_workers: False
 
 optimizer:
