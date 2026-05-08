@@ -82,6 +82,7 @@ def test_short_histories_repeat_left_pad_and_long_histories_keep_latest():
 
 
 class _FakePolicy:
+    horizon = 16
     n_action_steps = 8
 
     def __init__(self):
@@ -90,7 +91,8 @@ class _FakePolicy:
     def predict_action(self, obs):
         self.last_obs = obs
         action = torch.arange(8 * 48, dtype=torch.float32).reshape(1, 8, 48)
-        return {"action": action}
+        action_pred = torch.arange(16 * 48, dtype=torch.float32).reshape(1, 16, 48)
+        return {"action": action, "action_pred": action_pred}
 
 
 def test_engine_response_uses_pred_actions_contract():
@@ -101,9 +103,20 @@ def test_engine_response_uses_pred_actions_contract():
     response = engine.infer(_payload())
 
     assert set(response.keys()) == {"pred_actions"}
-    assert response["pred_actions"].shape == (8, 48)
+    assert response["pred_actions"].shape == (16, 48)
     assert response["pred_actions"].dtype == np.float32
     assert set(policy.last_obs.keys()) == {"image", "breast_image", "state"}
+
+
+def test_engine_metadata_reports_full_action_horizon_and_policy_action_steps():
+    policy = _FakePolicy()
+    adapter = LegendVlaObservationAdapter(_shape_meta(), n_obs_steps=2, device="cpu")
+    engine = DiffusionPolicyServingEngine(policy=policy, adapter=adapter, device="cpu")
+
+    metadata = engine.metadata()
+
+    assert metadata["action_horizon"] == 16
+    assert metadata["n_action_steps"] == 8
 
 
 def test_fake_client_payload_matches_model_interface_format():

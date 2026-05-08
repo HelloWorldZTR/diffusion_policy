@@ -206,10 +206,16 @@ class LegendVlaObservationAdapter:
             torch_obs[key] = tensor
         return torch_obs
 
-    def metadata(self, policy_name: str, n_action_steps: int | None = None) -> Dict[str, Any]:
+    def metadata(
+        self,
+        policy_name: str,
+        action_horizon: int | None = None,
+        n_action_steps: int | None = None,
+    ) -> Dict[str, Any]:
         return {
             "policy_name": policy_name,
-            "action_horizon": int(n_action_steps) if n_action_steps is not None else None,
+            "action_horizon": int(action_horizon) if action_horizon is not None else None,
+            "n_action_steps": int(n_action_steps) if n_action_steps is not None else None,
             "action_dim": self.action_dim,
             "n_obs_steps": self.n_obs_steps,
             "image_view_used": "both" if self.requires_chest_view else "head",
@@ -245,13 +251,21 @@ class DiffusionPolicyServingEngine:
         torch_obs = self.adapter.prepare_torch_obs(obs)
         with self._autocast_context(), torch.inference_mode():
             result = self.policy.predict_action(torch_obs)
-        action = result["action"][0].detach().to("cpu").float().numpy().astype(np.float32, copy=False)
+        # LegendVLA-Inference indexes into the full action horizon to keep an
+        # RTC overlap. Diffusion Policy's "action" is only n_action_steps.
+        action_tensor = result.get("action_pred", result["action"])
+        action = action_tensor[0].detach().to("cpu").float().numpy().astype(np.float32, copy=False)
         return {"pred_actions": action}
 
     def metadata(self) -> Dict[str, Any]:
         policy_name = type(self.policy).__name__
+        action_horizon = getattr(self.policy, "horizon", None)
         n_action_steps = getattr(self.policy, "n_action_steps", None)
-        return self.adapter.metadata(policy_name=policy_name, n_action_steps=n_action_steps)
+        return self.adapter.metadata(
+            policy_name=policy_name,
+            action_horizon=action_horizon,
+            n_action_steps=n_action_steps,
+        )
 
 
 def load_policy_checkpoint(
