@@ -360,8 +360,7 @@ class WdsHandImageDataset(torch.utils.data.IterableDataset):
         use_relative_action: bool = True,
         normalizer_cache_path: Optional[str] = None,
         normalizer_wds_datasets: Optional[DatasetSpec] = None,
-        max_normalizer_samples: int = 100000,
-        normalizer_max_rows: Optional[int] = None,
+        normalizer_max_rows: int = 100000,
         normalizer_cache_mode: str = "auto",
         normalizer_match_egovla_rot6d: bool = True,
     ):
@@ -394,9 +393,6 @@ class WdsHandImageDataset(torch.utils.data.IterableDataset):
             if normalizer_wds_datasets is not None
             else self.train_wds_datasets
         )
-        if normalizer_max_rows is None:
-            normalizer_max_rows = max_normalizer_samples
-        self.max_normalizer_samples = int(normalizer_max_rows)
         self.normalizer_max_rows = int(normalizer_max_rows)
         if self.normalizer_max_rows <= 0:
             raise ValueError("normalizer_max_rows must be a positive integer.")

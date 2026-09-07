@@ -119,7 +119,7 @@ def test_wds_hand_dataset_shapes_and_missing_instruction(tmp_path):
         state_stride=1,
         action_stride=1,
         shuffle_buffer=0,
-        max_normalizer_samples=16,
+        normalizer_max_rows=16,
     )
 
     batch = next(iter(DataLoader(dataset, batch_size=2, num_workers=0)))
@@ -285,7 +285,7 @@ def test_wds_hand_batch_policy_compute_loss_smoke(tmp_path):
         state_stride=1,
         action_stride=1,
         shuffle_buffer=0,
-        max_normalizer_samples=16,
+        normalizer_max_rows=16,
     )
     batch = next(iter(DataLoader(dataset, batch_size=1, num_workers=0)))
 
@@ -381,7 +381,7 @@ def test_wds_hand_batch_transformer_policy_compute_loss_smoke(tmp_path):
         state_stride=1,
         action_stride=1,
         shuffle_buffer=0,
-        max_normalizer_samples=16,
+        normalizer_max_rows=16,
     )
     batch = next(iter(DataLoader(dataset, batch_size=1, num_workers=0)))
 

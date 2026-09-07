@@ -73,7 +73,6 @@ def main():
         dataset.normalizer_cache_mode = args.cache_mode
     if args.max_rows is not None:
         dataset.normalizer_max_rows = int(args.max_rows)
-        dataset.max_normalizer_samples = int(args.max_rows)
 
     normalizer = dataset.get_normalizer()
     print(f"normalizer_keys: {list(normalizer.params_dict.keys())}")
