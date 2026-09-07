@@ -308,7 +308,7 @@ class TrainDiffusionUnetHybridWdsWorkspace(BaseWorkspace):
                                 ) as tepoch:
                                     for batch_idx, batch in enumerate(tepoch):
                                         batch = move_to_device(batch, device)
-                                        val_losses.append(self.model.compute_loss(batch))
+                                        val_losses.append(policy.compute_loss(batch))
                                         if (
                                             cfg.training.max_val_steps is not None
                                             and batch_idx >= cfg.training.max_val_steps - 1
