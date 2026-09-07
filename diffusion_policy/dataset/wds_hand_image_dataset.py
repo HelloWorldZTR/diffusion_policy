@@ -458,7 +458,11 @@ class WdsHandImageDataset(torch.utils.data.IterableDataset):
         pipeline = wds.WebDataset(
             shard_urls,
             shardshuffle=False,
-            nodesplitter=no_split if is_train else wds.split_by_node,
+            # Diverges from EgoVLA's `no_split if is_train else wds.split_by_node`:
+            # validation here is rank0-only and the normalizer can be fitted after
+            # dist init, so a node split would silently cover shards[rank::world_size].
+            # Restore it only together with all-rank validation and a loss all-reduce.
+            nodesplitter=no_split,
             workersplitter=no_split if is_train else wds.shardlists.split_by_worker,
             resampled=is_train,
             empty_check=False,
