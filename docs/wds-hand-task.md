@@ -99,6 +99,7 @@ Recommended default:
 - Let this repo fit and cache its own normalizer at `task.dataset.normalizer_cache_path`.
 - Keep `task.dataset.normalizer_cache_mode=auto`; the adapter validates cache metadata and regenerates when key settings or shard lists change.
 - Use `task.dataset.normalizer_cache_mode=refresh` to force a rewrite, or `readonly` to require an existing matching cache.
+- `normalizer_max_rows` is part of the validated metadata, so any change to the row budget rejects the cache, in either direction. Regenerate it rather than reusing statistics fitted over a different number of rows.
 
 Generate or refresh the cache explicitly:
 ```bash

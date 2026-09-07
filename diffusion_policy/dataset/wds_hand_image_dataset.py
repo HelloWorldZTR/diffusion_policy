@@ -74,6 +74,7 @@ NORMALIZER_METADATA_COMPARE_KEYS = (
     "normalizer_datasets",
     "expanded_shard_urls",
     "expanded_shard_count",
+    "normalizer_max_rows",
     "normalizer_keys",
 )
 
