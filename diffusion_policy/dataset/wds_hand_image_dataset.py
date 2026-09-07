@@ -209,7 +209,19 @@ def _homo_matrix_from_wrist_pose(wrist_pose: np.ndarray) -> tuple[np.ndarray, np
 
 
 def _transform_wrist_to_target_frame(wrist_pose: np.ndarray, target_extrinsic: np.ndarray) -> np.ndarray:
+    """
+    Re-express both wrist poses in the frame given by target_extrinsic.
+
+    Args:
+        wrist_pose: (..., 18) [left_trans3, right_trans3, left_rot6d, right_rot6d], float32.
+        target_extrinsic: (..., 4, 4) transform into the target frame, float32.
+
+    Returns:
+        (..., 18) wrist poses in the target frame, same layout as the input, float32.
+    """
     left, right = _homo_matrix_from_wrist_pose(wrist_pose)
+    # A single shared extrinsic has no leading time axis, so give it one to broadcast
+    # against the per-frame wrist matrices: 4 4 -> 1 4 4.
     if wrist_pose.ndim > target_extrinsic.ndim - 1:
         target_extrinsic = np.expand_dims(target_extrinsic, axis=-3)
     left = np.matmul(target_extrinsic, left)
@@ -220,19 +232,41 @@ def _transform_wrist_to_target_frame(wrist_pose: np.ndarray, target_extrinsic: n
 
 
 def _transform_points_to_target_frame(points: np.ndarray, target_extrinsic: np.ndarray) -> np.ndarray:
+    """
+    Apply a homogeneous transform to a flattened set of 3D points.
+
+    Args:
+        points: (..., N*3) flattened 3D points, float32.
+        target_extrinsic: (..., 4, 4) transform into the target frame, float32.
+
+    Returns:
+        (..., N*3) transformed points, same flattened layout as the input, float32.
+    """
     point_shape = points.shape
-    points = points.reshape(*point_shape[:-1], point_shape[-1] // 3, 3)
+    points = points.reshape(*point_shape[:-1], point_shape[-1] // 3, 3)  # ... N*3 -> ... N 3
     ones = np.ones(points.shape[:-1] + (1,), dtype=np.float32)
-    homo = np.concatenate([points, ones], axis=-1)[..., None]
+    homo = np.concatenate([points, ones], axis=-1)[..., None]  # ... N 3 -> ... N 4 1
+    # Two separate expands. The first gives a shared extrinsic the leading time axis it
+    # lacks; the second makes the 4x4 broadcast across the N points of every frame.
     if len(point_shape) + 1 > target_extrinsic.ndim:
         target_extrinsic = np.expand_dims(target_extrinsic, axis=-3)
-    target_extrinsic = np.expand_dims(target_extrinsic, axis=-3)
-    result = np.matmul(target_extrinsic, homo).squeeze(-1)
-    result = result[..., :3] / (result[..., 3:4] + 1e-6)
-    return result.reshape(point_shape).astype(np.float32)
+    target_extrinsic = np.expand_dims(target_extrinsic, axis=-3)  # ... 4 4 -> ... 1 4 4
+    result = np.matmul(target_extrinsic, homo).squeeze(-1)  # ... N 4 1 -> ... N 4
+    result = result[..., :3] / (result[..., 3:4] + 1e-6)  # ... N 4 -> ... N 3
+    return result.reshape(point_shape).astype(np.float32)  # ... N 3 -> ... N*3
 
 
 def _transform_hand_points_to_wrist_frame(hand_points: np.ndarray, wrist_pose: np.ndarray) -> np.ndarray:
+    """
+    Re-express each hand's fingertips in that hand's own wrist frame.
+
+    Args:
+        hand_points: (..., 30) fingertips, left hand in the first half and right in the second, float32.
+        wrist_pose: (..., 18) wrist poses in the same frame as hand_points, float32.
+
+    Returns:
+        (..., 30) fingertips in the per-hand wrist frames, same layout as the input, float32.
+    """
     dim = hand_points.shape[-1]
     left_points = hand_points[..., : dim // 2]
     right_points = hand_points[..., dim // 2 :]
@@ -245,6 +279,17 @@ def _transform_hand_points_to_wrist_frame(hand_points: np.ndarray, wrist_pose: n
 
 
 def _get_relative_action(state: np.ndarray, action: np.ndarray) -> np.ndarray:
+    """
+    Express an action chunk relative to one reference state row.
+
+    Args:
+        state: (48,) reference state, wrist pose in 0:18 and fingertips in 18:48, float32.
+        action: (Ta, 48) absolute actions in the same layout, float32.
+
+    Returns:
+        (Ta, 48) actions whose wrist poses sit in the reference wrist frames and whose
+        fingertips are offsets from the reference fingertips, float32.
+    """
     action = action.copy()
     for hand_idx in range(2):
         trans_slice = slice(hand_idx * 3, hand_idx * 3 + 3)
@@ -267,7 +312,26 @@ def process_wds_state_action(
     extrinsic: np.ndarray,
     use_relative_action: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Match EgoVLA's fingertips representation used by the new DP task."""
+    """
+    Match EgoVLA's fingertips representation used by the new DP task.
+
+    Args:
+        wrist_state: (Ts, 18) world-frame wrist poses, [left_trans3, right_trans3, left_rot6d, right_rot6d].
+        hand_state: (Ts, 30) world-frame fingertips, five points per hand, left then right.
+        wrist_action: (Ta, 18) future wrist poses, same layout as wrist_state.
+        hand_action: (Ta, 30) future fingertips, same layout as hand_state.
+        extrinsic: (16,) or (4, 4) head camera extrinsic, flattened row-major.
+        use_relative_action: express the action chunk relative to the latest state row.
+
+    Returns:
+        state: (Ts, 48) float32, an 18D wrist pose in the head camera frame followed by 30D
+            fingertips in the per-hand wrist frames.
+        action: (Ta, 48) float32. With use_relative_action=False it uses the same layout as
+            state. With use_relative_action=True (the default, and what the shipped config
+            uses) dims 0:18 are poses relative to the last state row's per-hand wrist frames
+            and dims 18:48 are fingertip offsets from that row, so the served actions are
+            relative and a consumer must invert them against the same reference state.
+    """
     extrinsic = extrinsic.reshape(4, 4).astype(np.float32)
     wrist_state = wrist_state.astype(np.float32)
     hand_state = hand_state.astype(np.float32)
@@ -507,7 +571,7 @@ class WdsHandImageDataset(torch.utils.data.IterableDataset):
         image = sample[key].astype(np.uint8)
         image = _pad_first_axis(image, self.n_obs_steps)
         image = self._resize_image_sequence(image, key)
-        image = np.moveaxis(image, -1, 1).astype(np.float32) / 255.0 # normalized to [0,1]
+        image = np.moveaxis(image, -1, 1).astype(np.float32) / 255.0  # T H W C -> T C H W, uint8 -> float32 in [0, 1]
         return image.astype(np.float32)
 
     def _sample_to_dp(self, sample: Dict) -> Dict[str, torch.Tensor]:
