@@ -4,7 +4,7 @@ This document describes the WDS hand/fingertip task added on 2026-05-05. It is a
 
 ## What It Trains
 
-The task uses `DiffusionUnetHybridImagePolicy` to predict future hand motion from:
+The task trains either `DiffusionUnetHybridImagePolicy` or `DiffusionTransformerHybridImagePolicy` to predict future hand motion from:
 - head RGB image history: `obs.image`
 - breast/chest RGB image history: `obs.breast_image`
 - self state history: `obs.state`
@@ -17,6 +17,7 @@ Tensor contract after collation:
 - `obs.breast_image`: `[B, n_obs_steps, 3, H, W]`, float32 in `[0, 1]`
 - `obs.state`: `[B, n_obs_steps, 48]`, float32
 - `action`: `[B, horizon, 48]`, float32
+- `__key__`: list of WDS sample ids, added by `webdataset.map`. Nothing in the training or serving path reads it.
 
 The 48D low-dimensional vector is:
 - 18D wrist pose or action
@@ -70,8 +71,7 @@ Important defaults:
 - `image_stride: 30`
 - `state_stride: 30`
 - `action_stride: 1`
-- train shards: `data/wds/train/shard-*.tar`
-- validation shards: `data/wds/val/shard-*.tar`
+- train/validation shards: set in `task.train_wds_datasets` / `task.val_wds_datasets`
 - normalizer cache: `data/wds/cache/wds_hand_normalizer.pt`
 - normalizer cache mode: `auto`
 - normalizer max rows per key: `100000`
@@ -201,17 +201,6 @@ Intended checks:
 - Dataset batches have Diffusion Policy-compatible shapes.
 - Episode tail windows keep fixed tensor shapes under truncate padding.
 - Optional policy smoke test runs `compute_loss()` when `robomimic` and `diffusers` are installed.
-
-Known verification status on 2026-05-06 after the dual-image conversion:
-- Static compile passed:
-  ```bash
-  python3 -m py_compile diffusion_policy/dataset/wds_hand_image_dataset.py tests/test_wds_hand_image_dataset.py tests/export_wds_hand_window.py tests/generate_wds_hand_normalizer.py
-  ```
-- Dataset/config pytest passed in the available `VLM` conda environment:
-  ```bash
-  conda run -n VLM python -m pytest -q tests/test_wds_hand_image_dataset.py
-  ```
-- Result: 6 passed, 2 skipped. The skipped policy smoke tests require `robomimic` and `diffusers`.
 
 Run the full WDS tests inside the project environment:
 ```bash

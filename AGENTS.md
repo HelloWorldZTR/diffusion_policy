@@ -38,7 +38,7 @@ export TRAIN_SHARDS='/path/to/train/shard-*.tar'
 export VAL_SHARDS='/path/to/val/shard-*.tar'
 export NORMALIZER_CACHE='data/wds/cache/wds_hand_normalizer.pt'
 ```
-or config them in `config/task/wds_hand_image.yaml`
+or set them directly in `diffusion_policy/config/task/wds_hand_image.yaml`
 
 Dataset unit checks:
 ```bash
@@ -131,6 +131,7 @@ Implementation notes:
 - The WDS workspace uses `training.steps_per_epoch` for scheduler length and epoch boundaries.
 - Under `torchrun`, the WDS workspaces wrap `policy.compute_loss()` with DDP via `PolicyLossWrapper`; do not call custom policy methods through raw DDP directly.
 - Both WDS workspaces use the Diffusion Policy batch schema `obs.image`, `obs.breast_image`, `obs.state`, and `action`; they do not consume LegendVLA's `images`, `states`, `actions`, or `actions_valid_mask` batch keys.
+- Collated batches also carry a `__key__` list of WDS sample ids, because `webdataset.map` copies `__key__` onto every mapped sample. Nothing reads it, and `move_to_device` passes non-tensors through unchanged.
 - Shard overrides must target `task.train_wds_datasets` / `task.val_wds_datasets`, which `task.dataset` interpolates. The normalizer cache records the shard list it was fitted on, so cache generation and training must be given the same shards or the cache is rejected.
 - Only rank0 writes wandb logs and checkpoints. All ranks train; rank0 runs validation and sampling while the other ranks wait at barriers.
 - WDS train dataloaders must keep `shuffle: False`; shard/sample shuffling is handled inside the WDS pipeline.
@@ -138,8 +139,6 @@ Implementation notes:
 - Normalizer fitting scans lowdim-only WDS samples with streaming stats and caches a metadata-validated payload at `task.dataset.normalizer_cache_path`.
 - `normalizer_cache_mode` supports `auto`, `refresh`, and `readonly`. Under torchrun, rank0 generates or refreshes cache while other ranks load it after the barrier.
 - The WDS normalizer matches EgoVLA's wrist rot6d ignore policy for `state/action` dimensions `6:18`.
+- `process_wds_state_action` is numerically equivalent to EgoVLA `process_state_action(motion_type='fingertips', hand_ndim=15)`, checked to float32 epsilon against real shards on 2026-09-07. The two implementations are separate copies, so changing either one without the other silently changes what the policy is trained on.
+- `hydra.main(version_base=None)` does not change the working directory under hydra-core 1.3.2, so a relative `normalizer_cache_path` resolves against the launch directory. `conda_environment.yaml` pins hydra-core 1.2.0, where that default is the opposite, so the pinned and the actually-used environments disagree on this.
 - Do not directly reuse an EgoVLA normalizer file as `normalizer_cache_path`. EgoVLA normalizers are keyed as `states/actions` or `motions`; this Diffusion Policy task requires `image/breast_image/state/action`. Refit from the same WDS shards with `tests/generate_wds_hand_normalizer.py`, or write an explicit converter that maps keys and verifies matching transform settings.
-
-Validation status:
-- `python3 -m py_compile diffusion_policy/dataset/wds_hand_image_dataset.py tests/test_wds_hand_image_dataset.py tests/export_wds_hand_window.py tests/generate_wds_hand_normalizer.py` passed on 2026-05-06 after the dual-image conversion.
-- `conda run -n VLM python -m pytest -q tests/test_wds_hand_image_dataset.py` passed on 2026-05-06 with 6 passed, 2 skipped. The skipped policy smoke tests need an environment with `robomimic` and `diffusers`.
