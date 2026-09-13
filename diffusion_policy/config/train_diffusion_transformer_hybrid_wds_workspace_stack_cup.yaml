@@ -23,6 +23,8 @@ policy:
 dataloader:
   # Two A800 GPUs: global batch 256; re-profile throughput for width 256.
   batch_size: 128
+  # Measured with two ranks on dp-train: ~766 windows/s versus ~344 with 4.
+  num_workers: 12
   pin_memory: True
 
 val_dataloader:

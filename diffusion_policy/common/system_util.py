@@ -41,3 +41,10 @@ def configure_data_loading_process():
 
 def data_loader_worker_init_fn(_worker_id):
     configure_data_loading_process()
+    # Parallelism comes from DataLoader workers. Avoid an OpenCV thread pool
+    # in every worker competing for the same CPU cores.
+    try:
+        import cv2
+    except ImportError:
+        return
+    cv2.setNumThreads(1)

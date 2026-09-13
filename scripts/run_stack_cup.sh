@@ -19,5 +19,7 @@ else
 fi
 
 # Workspace scales LR from the actual process count, per-rank batch, and accumulation.
+# Each rank has multiple loader workers; keep BLAS/OpenMP pools single-threaded.
+export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
 exec python3 -m torch.distributed.run --standalone --nproc_per_node="${NPROC_PER_NODE:-2}" \
     train_torchrun.py --config-name=train_diffusion_transformer_hybrid_wds_workspace_stack_cup "$@"
