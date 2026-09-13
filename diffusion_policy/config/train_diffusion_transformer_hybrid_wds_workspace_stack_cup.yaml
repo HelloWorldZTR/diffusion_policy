@@ -6,11 +6,12 @@ defaults:
 run_name: stack_the_cup_0908_xiaozi3_merged
 exp_name: ${run_name}
 
-# Conservative starting recipe informed by ahyw6ky8; not an inferred optimum
-# for the different stack-cup dataset. LR is the reference LR at global batch 256.
+# First evaluation budget targets 2026-09-14 14:00 Asia/Shanghai.
+# This is an experiment budget, not an inferred convergence requirement.
+# LR is the reference LR at global batch 256.
 run_settings:
   learning_rate: 1.0e-4
-  num_epochs: 200
+  num_epochs: 100
   num_inference_steps: 8
 
 policy:
@@ -49,7 +50,7 @@ training:
   fail_on_nonfinite: True
   val_every: 1
   sample_every: 5
-  checkpoint_every: 5
+  checkpoint_every: 1
 
 logging:
   entity: LegendaryVLA
