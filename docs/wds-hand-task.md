@@ -6,7 +6,7 @@ This document describes the WDS hand/fingertip task added on 2026-05-05. It is a
 
 The task trains either `DiffusionUnetHybridImagePolicy` or `DiffusionTransformerHybridImagePolicy` to predict future hand motion from:
 - head RGB image history: `obs.image`
-- breast/chest RGB image history: `obs.breast_image`
+- optional breast/chest RGB image history: `obs.breast_image` (omit from `shape_meta` for head-only training)
 - self state history: `obs.state`
 
 The model predicts:
@@ -31,7 +31,11 @@ Each WDS frame sample is expected to contain:
 - `<key>.meta.json`
 - `<key>.lowdim.npy`
 - `<key>.image.jpg`
-- `<key>.breast_image.jpg`
+- `<key>.breast_image.jpg` or `<key>.chest_image.jpg` for dual-camera training
+
+The DP adapter accepts both chest camera filenames and maps them to
+`obs.breast_image`. Head-only tasks declare only `obs.image` and `obs.state` in
+`shape_meta`; they do not load chest images or add a chest normalizer entry.
 
 `lowdim.npy` must follow the EgoVLA base layout:
 - `0:18`: `wrist_state`

@@ -454,6 +454,13 @@ def _ensure_instruction_meta(sample: Dict) -> Dict:
     return sample
 
 
+def _alias_chest_image(sample: Dict) -> Dict:
+    """Accept real-world chest camera filenames under DP's breast_image key."""
+    if "chest_image.jpg" in sample and "breast_image.jpg" not in sample:
+        sample["breast_image.jpg"] = sample["chest_image.jpg"]
+    return sample
+
+
 def _pad_first_axis(array: np.ndarray, length: int, mode: str = "edge") -> np.ndarray:
     if array.shape[0] == length:
         return array
@@ -540,12 +547,10 @@ class WdsHandImageDataset(torch.utils.data.IterableDataset):
                 raise ValueError(f"shape_meta.obs.{key}.shape must be [3,H,W], got {image_shape}")
             self.rgb_keys.append(str(key))
             self.image_hw_by_key[str(key)] = (int(image_shape[1]), int(image_shape[2]))
-        required_rgb_keys = {"image", "breast_image"}
-        missing_rgb_keys = required_rgb_keys - set(self.rgb_keys)
-        if missing_rgb_keys:
+        if set(self.rgb_keys) not in ({"image"}, {"image", "breast_image"}):
             raise ValueError(
-                "WdsHandImageDataset dual-image mode requires rgb obs keys "
-                f"{sorted(required_rgb_keys)}, missing {sorted(missing_rgb_keys)}"
+                "WdsHandImageDataset requires rgb obs keys ['image'] or "
+                f"['image', 'breast_image'], got {sorted(self.rgb_keys)}"
             )
         action_shape = tuple(shape_meta["action"]["shape"])
         if action_shape != (48,):
@@ -582,6 +587,12 @@ class WdsHandImageDataset(torch.utils.data.IterableDataset):
             return iter(())
         shard_urls = _expand_dataset_shards(datasets)
         is_train = self.mode == "train" if finite is None else not finite
+        load_breast = load_image and "breast_image" in self.rgb_keys
+        select_files = build_select_files(load_image=load_image, load_depth=False, load_breast=load_breast)
+
+        def select_camera_files(filename):
+            return select_files(filename) or (load_breast and filename.endswith(".chest_image.jpg"))
+
         pipeline = wds.WebDataset(
             shard_urls,
             shardshuffle=False,
@@ -593,11 +604,12 @@ class WdsHandImageDataset(torch.utils.data.IterableDataset):
             workersplitter=no_split if is_train else wds.shardlists.split_by_worker,
             resampled=is_train,
             empty_check=False,
-            select_files=build_select_files(load_image=load_image, load_depth=False, load_breast=load_image),
+            select_files=select_camera_files,
         )
         stages = [
             wds.map(decode_sample_fields),
             wds.map(_ensure_instruction_meta),
+            wds.map(_alias_chest_image),
             lambda src: sliding_window_compose(src, self.window_config),
         ]
         if is_train and self.keep_ratio < 1.0:
