@@ -50,7 +50,7 @@ training:
   checkpoint_every: 5
 
 logging:
-  entity: LegendVLA
+  entity: LegendaryVLA
   project: baseline-dp
   name: ${run_name}
   mode: online
