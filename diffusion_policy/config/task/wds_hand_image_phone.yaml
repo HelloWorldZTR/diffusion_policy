@@ -1,0 +1,54 @@
+name: wds_hand_image_single
+camera_mode: single
+
+image_shape: &image_shape [3, 240, 320]
+
+shape_meta: &shape_meta
+  obs:
+    image:
+      shape: *image_shape
+      type: rgb
+    state:
+      shape: [48]
+      type: low_dim
+  action:
+    shape: [48]
+
+train_wds_datasets: &train_wds_datasets
+  - name: phone_0508
+    shard_urls: /share_data/yeyuyao/real_world_finetune_corrected/pack_the_phone_0508/train/shard-*.tar
+  - name: phone_0512
+    shard_urls: /share_data/yeyuyao/real_world_finetune_corrected/put_the_phone_0512/train/shard-*.tar
+  - name: phone_0516
+    shard_urls: /share_data/yeyuyao/real_world_finetune_corrected/put_the_phone_0516/train/shard-*.tar
+
+val_wds_datasets: &val_wds_datasets
+  - name: phone_0508_val
+    shard_urls: /share_data/yeyuyao/real_world_finetune_corrected/pack_the_phone_0508/val/shard-*.tar
+  - name: phone_0512_val
+    shard_urls: /share_data/yeyuyao/real_world_finetune_corrected/put_the_phone_0512/val/shard-*.tar
+  - name: phone_0516_val
+    shard_urls: /share_data/yeyuyao/real_world_finetune_corrected/put_the_phone_0516/val/shard-*.tar
+
+dataset:
+  _target_: diffusion_policy.dataset.wds_hand_image_dataset.WdsHandImageDataset
+  shape_meta: *shape_meta
+  train_wds_datasets: *train_wds_datasets
+  val_wds_datasets: *val_wds_datasets
+  horizon: ${horizon}
+  n_obs_steps: ${dataset_obs_steps}
+  image_stride: 30
+  state_stride: 30
+  action_stride: 1
+  history_pad_mode: repeat
+  action_pad_mode: repeat
+  shuffle_buffer: 16384
+  shuffle_initial: 4096
+  keep_ratio: 0.2
+  camera_mode: ${task.camera_mode}
+  use_relative_action: True
+  normalizer_cache_path: data/wds/cache/wds_hand_single_normalizer.pt
+  normalizer_cache_mode: auto
+  normalizer_wds_datasets: *train_wds_datasets
+  normalizer_max_rows: 100000
+  normalizer_match_egovla_rot6d: True
