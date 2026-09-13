@@ -100,6 +100,21 @@ Important defaults:
 
 `training.steps_per_epoch` is required because the training dataset is streaming and has no meaningful length.
 
+All WDS Transformer configs set `policy.future_action_only: True`: the action
+sequence starts with the current frame's action field, while all observation
+frames end at the current frame. Every action can therefore attend to the entire
+observation history. Action self-attention remains causal. The returned `action`
+is `action_pred[:, :n_action_steps]`; with `pred_action_steps_only=True`, training
+also selects targets from index 0. Non-WDS Transformer policies default to the
+original aligned observation/action timeline and its `n_obs_steps - 1` start.
+
+The cross-attention mask buffer is retained for checkpoint compatibility but
+ignored in future-only mode, including after loading an older state dict. Older
+checkpoints whose saved config lacks `future_action_only` retain their original
+behavior when loaded for serving; train with the corrected WDS config to obtain
+a checkpoint with the new semantics. This fix changes conditioning, so loading
+old weights alone does not establish that a model has learned the corrected task.
+
 ## Normalizer Compatibility
 
 The current Diffusion Policy WDS task does not directly load an EgoVLA normalizer file as-is.

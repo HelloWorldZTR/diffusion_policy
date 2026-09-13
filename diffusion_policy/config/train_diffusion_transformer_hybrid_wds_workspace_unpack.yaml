@@ -52,6 +52,7 @@ policy:
   causal_attn: True
   time_as_cond: True
   obs_as_cond: ${obs_as_cond}
+  future_action_only: True # WDS targets start at the latest observation
 
 ema:
   _target_: diffusion_policy.model.diffusion.ema_model.EMAModel

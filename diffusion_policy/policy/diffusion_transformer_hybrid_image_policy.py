@@ -44,9 +44,12 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
             time_as_cond=True,
             obs_as_cond=True,
             pred_action_steps_only=False,
+            future_action_only=False,
             # parameters passed to step
             **kwargs):
         super().__init__()
+        if future_action_only and not obs_as_cond:
+            raise ValueError("future_action_only requires obs_as_cond=True")
 
         # parse shape_meta
         action_shape = shape_meta['action']['shape']
@@ -143,7 +146,7 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
         model = TransformerForDiffusion(
             input_dim=input_dim,
             output_dim=output_dim,
-            horizon=horizon,
+            horizon=n_action_steps if pred_action_steps_only else horizon,
             n_obs_steps=n_obs_steps,
             cond_dim=cond_dim,
             n_layer=n_layer,
@@ -154,7 +157,8 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
             causal_attn=causal_attn,
             time_as_cond=time_as_cond,
             obs_as_cond=obs_as_cond,
-            n_cond_layers=n_cond_layers
+            n_cond_layers=n_cond_layers,
+            causal_obs_attn=not future_action_only,
         )
 
         self.obs_encoder = obs_encoder
@@ -175,6 +179,8 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
         self.n_obs_steps = n_obs_steps
         self.obs_as_cond = obs_as_cond
         self.pred_action_steps_only = pred_action_steps_only
+        # WDS targets start at the latest observation, without historical actions.
+        self.action_start_index = 0 if future_action_only else n_obs_steps - 1
         self.resize_shape = resize_shape
         self.kwargs = kwargs
 
@@ -281,7 +287,7 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
         if self.pred_action_steps_only:
             action = action_pred
         else:
-            start = To - 1
+            start = self.action_start_index
             end = start + self.n_action_steps
             action = action_pred[:,start:end]
         
@@ -333,7 +339,7 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
             # reshape back to B, T, Do
             cond = nobs_features.reshape(batch_size, To, -1)
             if self.pred_action_steps_only:
-                start = To - 1
+                start = self.action_start_index
                 end = start + self.n_action_steps
                 trajectory = nactions[:,start:end]
         else:

@@ -22,7 +22,8 @@ class TransformerForDiffusion(ModuleAttrMixin):
             causal_attn: bool=False,
             time_as_cond: bool=True,
             obs_as_cond: bool=False,
-            n_cond_layers: int = 0
+            n_cond_layers: int = 0,
+            causal_obs_attn: bool = True,
         ) -> None:
         super().__init__()
 
@@ -146,6 +147,7 @@ class TransformerForDiffusion(ModuleAttrMixin):
         self.horizon = horizon
         self.time_as_cond = time_as_cond
         self.obs_as_cond = obs_as_cond
+        self.causal_obs_attn = causal_obs_attn
         self.encoder_only = encoder_only
 
         # init
@@ -333,7 +335,9 @@ class TransformerForDiffusion(ModuleAttrMixin):
                 tgt=x,
                 memory=memory,
                 tgt_mask=self.mask,
-                memory_mask=self.memory_mask
+                # Keep the buffer for checkpoint compatibility, but do not use
+                # its aligned-time mask when all observations precede actions.
+                memory_mask=self.memory_mask if self.causal_obs_attn else None
             )
             # (B,T,n_emb)
         
@@ -415,4 +419,3 @@ def test():
     timestep = torch.tensor(0)
     sample = torch.zeros((4,8,16))
     out = transformer(sample, timestep)
-
