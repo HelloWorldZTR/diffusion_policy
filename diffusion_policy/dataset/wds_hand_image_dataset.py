@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import copy
 import datetime
+import itertools
 import os
 import pathlib
+import re
 import tempfile
 import warnings
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Union
@@ -45,7 +47,7 @@ try:
         materialize_sample_media,
         no_split,
         resolve_shuffle_initial,
-        sliding_window_compose,
+        sliding_window_compose as _egovla_sliding_window_compose,
     )
 except ImportError as e:  # pragma: no cover - exercised only in missing optional deps envs
     raise ImportError(
@@ -56,6 +58,7 @@ except ImportError as e:  # pragma: no cover - exercised only in missing optiona
 
 NORMALIZER_CACHE_SCHEMA_VERSION = 1
 WDS_HAND_TRANSFORM_VERSION = "egovla_wds_hand_v1"
+WDS_HAND_WINDOW_VERSION = "frame_continuity_v1"
 EGOVLA_WRIST_ROT6D_SLICE = slice(6, 18)
 NORMALIZER_METADATA_COMPARE_KEYS = (
     "schema_version",
@@ -69,6 +72,7 @@ NORMALIZER_METADATA_COMPARE_KEYS = (
     "action_pad_mode",
     "use_relative_action",
     "transform_version",
+    "window_version",
     "match_egovla_rot6d",
     "rot6d_ignore_slice",
     "normalizer_datasets",
@@ -77,6 +81,68 @@ NORMALIZER_METADATA_COMPARE_KEYS = (
     "normalizer_max_rows",
     "normalizer_keys",
 )
+
+
+def _sample_frame_index(sample):
+    """Read an episode-local frame index, including pre-frame_idx WDS keys."""
+    meta = sample["meta.json"]
+    for field in ("frame_idx", "frame_index"):
+        value = meta.get(field)
+        if value is not None:
+            if isinstance(value, str) and value.isdecimal():
+                return int(value)
+            if isinstance(value, (int, np.integer)) and not isinstance(value, bool) and value >= 0:
+                return int(value)
+            raise ValueError(f"meta.{field} must be a non-negative integer, got {value!r}")
+
+    key = sample.get("__key__", "")
+    # Zarr keys end in _ep000000_f00000; older shards also use ep0_000000
+    # or episode0_000000. Arbitrary sample ids are not interpreted as time.
+    match = re.search(r"(?:_f|(?:^|_)(?:ep|episode)\d+_)(\d+)$", key)
+    if match:
+        return int(match.group(1))
+    if key.isdecimal():
+        return int(key)
+    return None
+
+
+def sliding_window_compose(src, config):
+    """Apply EgoVLA windows separately to each contiguous DP frame segment.
+
+    Splitting the source flushes the old window with its configured padding and
+    gives the next segment fresh history buffers. groupby streams with one frame
+    of lookahead, so even an infinite episode does not need to be materialized.
+    Consecutive frames may span shards; missing indices retain legacy episode-ID
+    boundary detection. This fix is local to DP and does not modify EgoVLA.
+    """
+    previous_episode = None
+    previous_frame_idx = None
+    segment_id = 0
+
+    def segment_key(sample):
+        nonlocal previous_episode, previous_frame_idx, segment_id
+        try:
+            meta = sample["meta.json"]
+            episode = (meta.get("dataset_name", ""), meta["episode_index"])
+            frame_idx = _sample_frame_index(sample)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Invalid WDS frame metadata: shard={sample.get('__url__', '')!r}, "
+                f"key={sample.get('__key__', '')!r}"
+            ) from exc
+        discontinuous = (
+            frame_idx is not None
+            and previous_frame_idx is not None
+            and frame_idx != previous_frame_idx + 1
+        )
+        if episode != previous_episode or discontinuous:
+            segment_id += 1
+        previous_episode = episode
+        previous_frame_idx = frame_idx
+        return segment_id
+
+    for _, frames in itertools.groupby(src, key=segment_key):
+        yield from _egovla_sliding_window_compose(frames, config)
 
 
 class StreamingArrayStats:
@@ -651,6 +717,7 @@ class WdsHandImageDataset(torch.utils.data.IterableDataset):
             "action_pad_mode": self.action_pad_mode,
             "use_relative_action": self.use_relative_action,
             "transform_version": WDS_HAND_TRANSFORM_VERSION,
+            "window_version": WDS_HAND_WINDOW_VERSION,
             "match_egovla_rot6d": self.normalizer_match_egovla_rot6d,
             "rot6d_ignore_slice": [EGOVLA_WRIST_ROT6D_SLICE.start, EGOVLA_WRIST_ROT6D_SLICE.stop],
             "normalizer_datasets": _jsonable(self.normalizer_wds_datasets),

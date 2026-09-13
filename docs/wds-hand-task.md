@@ -46,6 +46,26 @@ Episode boundaries are read from `meta.json`:
 
 If these are missing, the adapter supplies defaults, but real training data should provide stable episode metadata so windows do not cross demonstrations.
 
+Within an episode, windows also require consecutive frame indices. The DP-local
+wrapper in `diffusion_policy/dataset/wds_hand_image_dataset.py` splits the stream
+into contiguous segments before invoking EgoVLA's unmodified composer. It
+reads `meta.frame_idx` (or `frame_index`), falling back to the frame number in
+existing keys such as `<dataset>_ep000000_f00000`, `episode0_000000`, or
+`ep0000_000000` (plain numeric keys are also supported). New data producers should
+write `frame_idx` explicitly. Indices are non-negative integers advancing by one
+per stored frame; the configured image/state/action strides are applied later.
+Repeated, backwards, or skipped indices flush the old action/future-frame window
+using its configured padding mode and reset observation history. This prevents
+resampled episodes from joining their tails to their next replay. Consecutive
+frames can still span different tar shards. Legacy samples without either an
+index or a recognized key retain episode-ID-only boundary detection and cannot
+reliably detect replay; provide `frame_idx` for those datasets.
+
+Normalizer cache metadata includes the window-continuity version. Existing
+metadata-bearing caches are regenerated in `auto` mode; with `readonly`, refresh
+the cache before training. Bare legacy caches remain subject to the compatibility
+limitations described below.
+
 ## Representation
 
 The dataset adapter uses the selected EgoVLA-style fingertip representation:
