@@ -1,0 +1,68 @@
+defaults:
+  - train_diffusion_transformer_hybrid_wds_workspace_fold
+  - override task: wds_hand_image_stack_cup
+  - _self_
+
+run_name: stack_the_cup_0908_xiaozi3_merged
+exp_name: ${run_name}
+
+# Conservative starting recipe informed by ahyw6ky8; not an inferred optimum
+# for the different stack-cup dataset. LR is the reference LR at global batch 256.
+run_settings:
+  learning_rate: 1.0e-4
+  num_epochs: 200
+  num_inference_steps: 8
+
+policy:
+  # Official Diffusion Policy Transformer width (fold recipe inherits 768).
+  n_emb: 256
+  future_action_only: True
+  # DDIM inherited from the fold recipe; sampling steps do not affect noise loss.
+  num_inference_steps: ${run_settings.num_inference_steps}
+
+dataloader:
+  # Two A800 GPUs: global batch 256; re-profile throughput for width 256.
+  batch_size: 128
+  pin_memory: True
+
+val_dataloader:
+  batch_size: 128
+  pin_memory: True
+
+optimizer:
+  # Reference rate; workspace scales it using actual WORLD_SIZE before scheduling.
+  learning_rate: ${run_settings.learning_rate}
+
+training:
+  resume: False
+  num_epochs: ${run_settings.num_epochs}
+  steps_per_epoch: 1000
+  gradient_accumulate_every: 1
+  lr_warmup_steps: 2000
+  lr_scale:
+    reference_batch_size: 256
+    rule: sqrt
+    max_lr: 2.0e-4
+  max_grad_norm: 1.0
+  fail_on_nonfinite: True
+  val_every: 1
+  sample_every: 5
+  checkpoint_every: 5
+
+logging:
+  entity: LegendVLA
+  project: baseline-dp
+  name: ${run_name}
+  mode: online
+  resume: False
+  tags: [diffusion_transformer, wds, head_only, relative48, "${run_name}"]
+
+multi_run:
+  run_dir: data/outputs/${run_name}/${now:%Y.%m.%d-%H.%M.%S}
+  wandb_name_base: ${run_name}
+
+hydra:
+  job:
+    chdir: False
+  run:
+    dir: ${multi_run.run_dir}

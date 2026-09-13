@@ -1,0 +1,43 @@
+name: stack_the_cup_0908_xiaozi3_merged
+
+image_shape: [3, 240, 320]
+shape_meta:
+  obs:
+    image:
+      shape: ${task.image_shape}
+      type: rgb
+    state:
+      shape: [48]
+      type: low_dim
+  action:
+    shape: [48]
+
+train_wds_datasets:
+  - name: stack_the_cup_0908_xiaozi3_merged_train
+    shard_urls: /efs-exp/egosteer/datasets/real_world_wds_chest/Stack_the_cup_0908_xiaozi3_merged/train/shard-*.tar
+val_wds_datasets:
+  - name: stack_the_cup_0908_xiaozi3_merged_val
+    shard_urls: /efs-exp/egosteer/datasets/real_world_wds_chest/Stack_the_cup_0908_xiaozi3_merged/val/shard-*.tar
+
+dataset:
+  _target_: diffusion_policy.dataset.wds_hand_image_dataset.WdsHandImageDataset
+  shape_meta: ${task.shape_meta}
+  train_wds_datasets: ${task.train_wds_datasets}
+  val_wds_datasets: ${task.val_wds_datasets}
+  horizon: ${horizon}
+  n_obs_steps: ${dataset_obs_steps}
+  image_stride: 30
+  state_stride: 30
+  action_stride: 1
+  history_pad_mode: repeat
+  action_pad_mode: repeat
+  shuffle_buffer: 16384
+  shuffle_initial: 4096
+  keep_ratio: 0.2
+  use_relative_action: True
+  normalizer_cache_path: /efs-exp/egosteer/zhangtingrui/normalizers/stack_the_cup_0908_xiaozi3_merged_head_relative48_h16_obs2_stride30.pt
+  normalizer_cache_mode: readonly
+  normalizer_wds_datasets: ${task.train_wds_datasets}
+  # Scan the complete finite training split; verify effective row counts are below this cap.
+  normalizer_max_rows: 10000000
+  normalizer_match_egovla_rot6d: True

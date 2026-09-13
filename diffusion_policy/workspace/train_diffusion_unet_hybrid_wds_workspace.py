@@ -19,7 +19,7 @@ import torch.distributed as dist
 import torch.nn as nn
 import tqdm
 import wandb
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, open_dict
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 
@@ -27,6 +27,7 @@ from diffusion_policy.common.checkpoint_util import TopKCheckpointManager
 from diffusion_policy.common.json_logger import JsonLogger
 from diffusion_policy.common.pytorch_util import move_to_device, optimizer_to
 from diffusion_policy.common.system_util import data_loader_worker_init_fn
+from diffusion_policy.common.wds_training_util import batch_scaled_learning_rate
 from diffusion_policy.model.common.lr_scheduler import get_scheduler
 from diffusion_policy.model.diffusion.ema_model import EMAModel
 from diffusion_policy.policy.diffusion_unet_hybrid_image_policy import DiffusionUnetHybridImagePolicy
@@ -46,7 +47,7 @@ class PolicyLossWrapper(nn.Module):
 
 
 class TrainDiffusionUnetHybridWdsWorkspace(BaseWorkspace):
-    include_keys = ["global_step", "epoch"]
+    include_keys = ["global_step", "epoch", "optimizer_run_metadata"]
     exclude_keys = ["ddp_model"]
 
     def __init__(self, cfg: OmegaConf, output_dir=None):
@@ -124,6 +125,46 @@ class TrainDiffusionUnetHybridWdsWorkspace(BaseWorkspace):
             if latest_ckpt_path.is_file():
                 print(f"Resuming from checkpoint {latest_ckpt_path}")
                 self.load_checkpoint(path=latest_ckpt_path)
+                # WDS checkpoints are saved at epoch end before these counters
+                # advance. Resume from the next minibatch/epoch, not the saved one.
+                self.global_step += 1
+                self.epoch += 1
+
+        accumulation = int(cfg.training.gradient_accumulate_every)
+        if accumulation <= 0 or steps_per_epoch % accumulation:
+            raise ValueError("steps_per_epoch must be divisible by positive gradient_accumulate_every")
+        lr_scale = cfg.training.get("lr_scale", {})
+        lr_key = "learning_rate" if "learning_rate" in cfg.optimizer else "lr"
+        scaled_lr, effective_batch = batch_scaled_learning_rate(
+            float(cfg.optimizer[lr_key]), int(cfg.dataloader.batch_size),
+            self.world_size, accumulation, **lr_scale,
+        )
+        with open_dict(cfg.training):
+            cfg.training.reference_learning_rate = float(cfg.optimizer[lr_key])
+            cfg.training.effective_batch_size = effective_batch
+            cfg.training.world_size = self.world_size
+            cfg.training.scaled_learning_rate = scaled_lr
+        self.optimizer_run_metadata = {
+            "world_size": self.world_size,
+            "batch_size_per_rank": int(cfg.dataloader.batch_size),
+            "gradient_accumulate_every": accumulation,
+            "effective_batch_size": effective_batch,
+            "reference_learning_rate": float(cfg.optimizer[lr_key]),
+            "scaled_learning_rate": scaled_lr,
+        }
+        if lr_scale:
+            for group in self.optimizer.param_groups:
+                group["lr"] = scaled_lr
+                group["initial_lr"] = scaled_lr
+            cfg.optimizer[lr_key] = scaled_lr
+        if self.is_rank0:
+            print(f"Effective batch={effective_batch} "
+                  f"({cfg.dataloader.batch_size} x {self.world_size} x {accumulation}), "
+                  f"peak LR={scaled_lr:.8g}")
+        max_grad_norm = cfg.training.get("max_grad_norm", None)
+        if max_grad_norm is not None and max_grad_norm <= 0:
+            raise ValueError("max_grad_norm must be positive")
+        fail_on_nonfinite = bool(cfg.training.get("fail_on_nonfinite", False))
 
         def wds_dataloader_kwargs(dataloader_cfg):
             kwargs = OmegaConf.to_container(dataloader_cfg, resolve=True)
@@ -166,12 +207,14 @@ class TrainDiffusionUnetHybridWdsWorkspace(BaseWorkspace):
             num_warmup_steps=cfg.training.lr_warmup_steps,
             num_training_steps=(steps_per_epoch * cfg.training.num_epochs)
             // cfg.training.gradient_accumulate_every,
-            last_epoch=self.global_step - 1,
+            last_epoch=self.global_step // accumulation - 1,
         )
 
         ema: EMAModel = None
         if cfg.training.use_ema:
             ema = hydra.utils.instantiate(cfg.ema, model=self.ema_model)
+            # The controller is reconstructed on resume; preserve EMA warmup age.
+            ema.optimization_step = self.global_step // accumulation
 
         wandb_run = None
         if self.is_rank0:
@@ -203,6 +246,7 @@ class TrainDiffusionUnetHybridWdsWorkspace(BaseWorkspace):
             )
 
         train_sampling_batch = None
+        val_sampling_batch = None
 
         if cfg.training.debug:
             cfg.training.num_epochs = 2
@@ -231,7 +275,7 @@ class TrainDiffusionUnetHybridWdsWorkspace(BaseWorkspace):
 
         try:
             with json_logger_context as json_logger:
-                for _ in range(cfg.training.num_epochs):
+                for epoch_index in range(self.epoch, cfg.training.num_epochs):
                     step_log = {}
                     train_losses = []
 
@@ -254,16 +298,33 @@ class TrainDiffusionUnetHybridWdsWorkspace(BaseWorkspace):
                             raw_loss = self.ddp_model(batch)
                         else:
                             raw_loss = self.model.compute_loss(batch)
-                        loss = raw_loss / cfg.training.gradient_accumulate_every
+                        if fail_on_nonfinite:
+                            finite = torch.isfinite(raw_loss.detach()).to(dtype=torch.int32)
+                            if self.distributed:
+                                dist.all_reduce(finite, op=dist.ReduceOp.MIN)
+                            if not finite.item():
+                                raise FloatingPointError(
+                                    f"Non-finite loss on at least one rank before optimizer update; "
+                                    f"rank={self.rank}, step={self.global_step}, "
+                                    f"local_sample_keys={batch.get('__key__', [])}"
+                                )
+                        loss = raw_loss / accumulation
                         loss.backward()
 
-                        if self.global_step % cfg.training.gradient_accumulate_every == 0:
+                        grad_norm = None
+                        if (self.global_step + 1) % accumulation == 0:
+                            if max_grad_norm is not None or fail_on_nonfinite:
+                                grad_norm = torch.nn.utils.clip_grad_norm_(
+                                    self.model.parameters(),
+                                    max_norm=max_grad_norm if max_grad_norm is not None else float("inf"),
+                                    error_if_nonfinite=fail_on_nonfinite,
+                                ).item()
                             self.optimizer.step()
                             self.optimizer.zero_grad()
                             lr_scheduler.step()
 
-                        if cfg.training.use_ema:
-                            ema.step(self.model)
+                            if cfg.training.use_ema:
+                                ema.step(self.model)
 
                         raw_loss_cpu = raw_loss.item()
                         if self.is_rank0 and hasattr(iterator, "set_postfix"):
@@ -275,6 +336,9 @@ class TrainDiffusionUnetHybridWdsWorkspace(BaseWorkspace):
                             "epoch": self.epoch,
                             "lr": lr_scheduler.get_last_lr()[0],
                         }
+                        if grad_norm is not None:
+                            step_log["grad_norm"] = grad_norm  # before clipping
+                            step_log["grad_clipped"] = int(max_grad_norm is not None and grad_norm > max_grad_norm)
 
                         is_last_batch = batch_idx == steps_per_epoch - 1
                         if not is_last_batch:
@@ -308,6 +372,8 @@ class TrainDiffusionUnetHybridWdsWorkspace(BaseWorkspace):
                                 ) as tepoch:
                                     for batch_idx, batch in enumerate(tepoch):
                                         batch = move_to_device(batch, device)
+                                        if val_sampling_batch is None:
+                                            val_sampling_batch = batch
                                         val_losses.append(policy.compute_loss(batch))
                                         if (
                                             cfg.training.max_val_steps is not None
@@ -323,8 +389,19 @@ class TrainDiffusionUnetHybridWdsWorkspace(BaseWorkspace):
                                 result = policy.predict_action(batch["obs"])
                                 mse = torch.nn.functional.mse_loss(result["action_pred"], batch["action"])
                                 step_log["train_action_mse_error"] = mse.item()
+                                if val_sampling_batch is not None:
+                                    prediction = policy.predict_action(val_sampling_batch["obs"])["action_pred"]
+                                    target = val_sampling_batch["action"]
+                                    step_log["val_action_mse_error"] = torch.nn.functional.mse_loss(prediction, target).item()
+                                    if target.shape[-1] == 48:
+                                        for name, dims in (("eef_translation", slice(0, 6)),
+                                                           ("eef_rot6d", slice(6, 18)),
+                                                           ("fingertips", slice(18, 48))):
+                                            step_log[f"val_action_{name}_mse"] = torch.nn.functional.mse_loss(
+                                                prediction[..., dims], target[..., dims]
+                                            ).item()
 
-                        if (self.epoch % cfg.training.checkpoint_every) == 0:
+                        if (self.epoch % cfg.training.checkpoint_every) == 0 or epoch_index == cfg.training.num_epochs - 1:
                             if cfg.checkpoint.save_last_ckpt:
                                 self.save_checkpoint()
                             if cfg.checkpoint.save_last_snapshot:
